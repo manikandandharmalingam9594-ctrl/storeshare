@@ -103,20 +103,24 @@ class ProviderAgent:
             except Exception as exc:
                 raise RuntimeError(f"Failed to connect to coordinator at {self.coordinator_url}: {exc}") from exc
 
-            if res.status_code != 200:
+            if res.status_code == 200:
+                user_data = res.json()
+                if user_data.get("role") != "PROVIDER":
+                    raise PermissionError(
+                        f"Account {user_data.get('email')} has role '{user_data.get('role')}', "
+                        "but only 'PROVIDER' accounts can run a storage node."
+                    )
+
+                self.provider_id = user_data["id"]
+                self.provider_email = user_data["email"]
+                logger.info(f"Authenticated as Provider #{self.provider_id} ({self.provider_email}).")
+                return user_data
+
+            # If token was rejected (e.g. 401 expired), clear it and fall back to email/password if available
+            logger.warning(f"Existing token rejected by coordinator (HTTP {res.status_code}). Clearing invalid token.")
+            self.token = None
+            if not (self.config.email and self.config.password):
                 raise RuntimeError(f"Authentication failed: token rejected by coordinator (HTTP {res.status_code}).")
-
-            user_data = res.json()
-            if user_data.get("role") != "PROVIDER":
-                raise PermissionError(
-                    f"Account {user_data.get('email')} has role '{user_data.get('role')}', "
-                    "but only 'PROVIDER' accounts can run a storage node."
-                )
-
-            self.provider_id = user_data["id"]
-            self.provider_email = user_data["email"]
-            logger.info(f"Authenticated as Provider #{self.provider_id} ({self.provider_email}).")
-            return user_data
 
         # If email & password are provided, log in via POST /api/auth/login
         if self.config.email and self.config.password:
@@ -175,6 +179,16 @@ class ProviderAgent:
             json=payload,
         )
 
+        if res.status_code == 401 and (self.config.email and self.config.password):
+            logger.warning("Node setup returned HTTP 401; re-authenticating...")
+            self.token = None
+            self.authenticate()
+            res = self.client.post(
+                "/api/provider/node/setup",
+                headers=self._get_auth_headers(),
+                json=payload,
+            )
+
         if res.status_code != 200:
             raise RuntimeError(f"Failed to register storage setup (HTTP {res.status_code}): {res.text}")
 
@@ -203,6 +217,16 @@ class ProviderAgent:
             headers=self._get_auth_headers(),
             json=payload,
         )
+
+        if res.status_code == 401 and (self.config.email and self.config.password):
+            logger.warning("Heartbeat returned HTTP 401; re-authenticating...")
+            self.token = None
+            self.authenticate()
+            res = self.client.post(
+                "/api/provider/node/heartbeat",
+                headers=self._get_auth_headers(),
+                json=payload,
+            )
 
         if res.status_code != 200:
             raise RuntimeError(f"Heartbeat failed (HTTP {res.status_code}): {res.text}")
@@ -242,7 +266,15 @@ class ProviderAgent:
         elif res.status_code == 401:
             logger.warning("Token expired or unauthorized during job poll; re-authenticating...")
             try:
+                self.token = None
                 self.authenticate()
+                res = self.client.get(
+                    "/api/provider/jobs",
+                    headers=self._get_auth_headers(),
+                    params={"limit": limit},
+                )
+                if res.status_code == 200:
+                    return res.json()
             except Exception as exc:
                 logger.error(f"Re-authentication failed: {exc}")
             return []
@@ -261,6 +293,13 @@ class ProviderAgent:
             f"/api/provider/jobs/{job_id}/data",
             headers={"Authorization": f"Bearer {self.token}"},
         )
+        if res.status_code == 401 and (self.config.email and self.config.password):
+            self.token = None
+            self.authenticate()
+            res = self.client.get(
+                f"/api/provider/jobs/{job_id}/data",
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
         if res.status_code != 200:
             raise RuntimeError(f"Failed to download job data (HTTP {res.status_code}): {res.text}")
         return res.content
@@ -280,6 +319,17 @@ class ProviderAgent:
             },
             content=data,
         )
+        if res.status_code == 401 and (self.config.email and self.config.password):
+            self.token = None
+            self.authenticate()
+            res = self.client.post(
+                f"/api/provider/jobs/{job_id}/data",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/octet-stream",
+                },
+                content=data,
+            )
         if res.status_code != 200:
             raise RuntimeError(f"Failed to upload retrieved chunk data (HTTP {res.status_code}): {res.text}")
         return res.json()
@@ -295,6 +345,14 @@ class ProviderAgent:
             f"/api/provider/jobs/{job_id}/complete",
             headers=self._get_auth_headers(),
         )
+        if res.status_code == 401 and (self.config.email and self.config.password):
+            logger.warning("complete_job returned HTTP 401; re-authenticating...")
+            self.token = None
+            self.authenticate()
+            res = self.client.post(
+                f"/api/provider/jobs/{job_id}/complete",
+                headers=self._get_auth_headers(),
+            )
         if res.status_code != 200:
             raise RuntimeError(f"Failed to acknowledge job completion (HTTP {res.status_code}): {res.text}")
         return res.json()
@@ -312,6 +370,15 @@ class ProviderAgent:
                 headers=self._get_auth_headers(),
                 json={"error_message": error_message},
             )
+            if res.status_code == 401 and (self.config.email and self.config.password):
+                logger.warning("fail_job returned HTTP 401; re-authenticating...")
+                self.token = None
+                self.authenticate()
+                res = self.client.post(
+                    f"/api/provider/jobs/{job_id}/fail",
+                    headers=self._get_auth_headers(),
+                    json={"error_message": error_message},
+                )
             if res.status_code != 200:
                 logger.warning(f"Failed to report job failure to coordinator (HTTP {res.status_code}): {res.text}")
                 return {}

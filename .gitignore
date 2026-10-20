@@ -37,6 +37,7 @@ venv/
 data/*.db
 data/*.db-journal
 data/*.sqlite3
+data/*.backup
 !data/.gitkeep
 
 # Node / Frontend

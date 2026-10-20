@@ -2,117 +2,84 @@ import Navbar from './components/Navbar'
 import LoginForm from './components/LoginForm'
 import RegisterForm from './components/RegisterForm'
 import { AuthProvider, useAuth } from './context/AuthContext'
-import { RouterProvider, useRouter } from './context/RouterContext'
+import { Navigate, RouterProvider, useRouter } from './context/RouterContext'
 import AccessDeniedPage from './pages/AccessDeniedPage'
 import AdminDashboard from './pages/AdminDashboard'
 import ConsumerDashboard from './pages/ConsumerDashboard'
 import ProviderDashboard from './pages/ProviderDashboard'
 import SystemStatusPage from './pages/SystemStatusPage'
 
-function AppRoutes() {
+import { getUserDashboardPath, resolveRoute, RouteAction } from './services/routing'
+
+export function AppRoutes() {
   const { currentPath, navigate } = useRouter()
   const { user, isAuthenticated, isLoading } = useAuth()
 
-  // Helper to determine the default dashboard for an authenticated user
-  const getUserDashboardPath = (role) => {
-    if (role === 'ADMIN') return '/admin'
-    if (role === 'PROVIDER') return '/provider'
-    return '/consumer'
-  }
+  const decision = resolveRoute({
+    currentPath,
+    isAuthenticated,
+    userRole: user?.role,
+    isLoading,
+  })
 
-  // Initial session restoration state
-  if (isLoading) {
-    return (
-      <div className="auth-card-container">
-        <div className="glass-card" style={{ textAlign: 'center', padding: '40px' }}>
-          <span className="spinner" style={{ width: '28px', height: '28px', borderWidth: '3px', marginBottom: '16px' }} />
-          <h3 style={{ fontSize: '1.1rem', color: '#f8fafc' }}>Verifying Authentication Session...</h3>
-          <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '6px' }}>
-            Validating Bearer credentials against backend node...
-          </p>
+  switch (decision.type) {
+    case RouteAction.LOADING:
+      return (
+        <div className="auth-card-container">
+          <div className="glass-card" style={{ textAlign: 'center', padding: '40px' }}>
+            <span className="spinner" style={{ width: '28px', height: '28px', borderWidth: '3px', marginBottom: '16px' }} />
+            <h3 style={{ fontSize: '1.1rem', color: '#f8fafc' }}>Verifying Authentication Session...</h3>
+            <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '6px' }}>
+              Validating Bearer credentials against backend node...
+            </p>
+          </div>
         </div>
-      </div>
-    )
-  }
+      )
 
-  // 1. Status / Diagnostics Page
-  if (currentPath === '/' || currentPath === '/status') {
-    return <SystemStatusPage />
-  }
+    case RouteAction.REDIRECT:
+      return <Navigate to={decision.redirectTo} replace={decision.replace} />
 
-  // 2. Login Page
-  if (currentPath === '/login') {
-    if (isAuthenticated) {
-      // Redirect authenticated users to their authorized dashboard
-      navigate(getUserDashboardPath(user.role))
-      return null
-    }
-    return <LoginForm />
-  }
+    case RouteAction.RENDER_STATUS:
+      return <SystemStatusPage />
 
-  // 3. Consumer Registration Page
-  if (currentPath === '/register') {
-    if (isAuthenticated) {
-      navigate(getUserDashboardPath(user.role))
-      return null
-    }
-    return <RegisterForm />
-  }
+    case RouteAction.RENDER_LOGIN:
+      return <LoginForm />
 
-  // 4. Role-Protected Dashboard: Consumer
-  if (currentPath === '/consumer') {
-    if (!isAuthenticated) {
-      navigate('/login')
-      return null
-    }
-    if (user.role !== 'CONSUMER') {
-      return <AccessDeniedPage requiredRole="CONSUMER" />
-    }
-    return <ConsumerDashboard />
-  }
+    case RouteAction.RENDER_REGISTER:
+      return <RegisterForm />
 
-  // 5. Role-Protected Dashboard: Provider
-  if (currentPath === '/provider') {
-    if (!isAuthenticated) {
-      navigate('/login')
-      return null
-    }
-    if (user.role !== 'PROVIDER') {
-      return <AccessDeniedPage requiredRole="PROVIDER" />
-    }
-    return <ProviderDashboard />
-  }
+    case RouteAction.RENDER_CONSUMER:
+      return <ConsumerDashboard />
 
-  // 6. Role-Protected Dashboard: Admin
-  if (currentPath === '/admin') {
-    if (!isAuthenticated) {
-      navigate('/login')
-      return null
-    }
-    if (user.role !== 'ADMIN') {
-      return <AccessDeniedPage requiredRole="ADMIN" />
-    }
-    return <AdminDashboard />
-  }
+    case RouteAction.RENDER_PROVIDER:
+      return <ProviderDashboard />
 
-  // Fallback route: unknown path
-  return (
-    <div className="auth-card-container">
-      <div className="glass-card" style={{ textAlign: 'center', maxWidth: '480px' }}>
-        <h3 style={{ fontSize: '1.25rem', marginBottom: '8px' }}>Page Not Found</h3>
-        <p style={{ color: '#94a3b8', marginBottom: '20px' }}>
-          The requested route <code>{currentPath}</code> does not exist on this node.
-        </p>
-        <button
-          type="button"
-          className="action-btn"
-          onClick={() => navigate(isAuthenticated ? getUserDashboardPath(user.role) : '/login')}
-        >
-          {isAuthenticated ? 'Go to My Dashboard' : 'Go to Sign In'}
-        </button>
-      </div>
-    </div>
-  )
+    case RouteAction.RENDER_ADMIN:
+      return <AdminDashboard />
+
+    case RouteAction.RENDER_ACCESS_DENIED:
+      return <AccessDeniedPage requiredRole={decision.requiredRole} />
+
+    case RouteAction.RENDER_NOT_FOUND:
+    default:
+      return (
+        <div className="auth-card-container">
+          <div className="glass-card" style={{ textAlign: 'center', maxWidth: '480px' }}>
+            <h3 style={{ fontSize: '1.25rem', marginBottom: '8px' }}>Page Not Found</h3>
+            <p style={{ color: '#94a3b8', marginBottom: '20px' }}>
+              The requested route <code>{currentPath}</code> does not exist on this node.
+            </p>
+            <button
+              type="button"
+              className="action-btn"
+              onClick={() => navigate(isAuthenticated ? getUserDashboardPath(user?.role) : '/login')}
+            >
+              {isAuthenticated ? 'Go to My Dashboard' : 'Go to Sign In'}
+            </button>
+          </div>
+        </div>
+      )
+  }
 }
 
 export default function App() {

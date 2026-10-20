@@ -1,9 +1,28 @@
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import logging
 import os
 import re
 import sqlite3
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Union
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    PSYCOPG_AVAILABLE = True
+except ImportError:
+    psycopg = None
+    dict_row = None
+    PSYCOPG_AVAILABLE = False
+
+logger = logging.getLogger("store-share-database")
 
 MAX_FILE_SIZE_BYTES: int = 5 * 1024 * 1024  # 5 Megabytes
 CHUNK_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
@@ -14,9 +33,31 @@ PROJECT_ROOT: Path = BACKEND_DIR.parent
 DATA_DIR: Path = PROJECT_ROOT / "data"
 
 
+def get_database_url() -> Optional[str]:
+    """
+    Get configured PostgreSQL connection URL if set (via STORESHARE_DATABASE_URL).
+    """
+    url = os.environ.get("STORESHARE_DATABASE_URL")
+    if url and url.strip():
+        return url.strip()
+    return None
+
+
+def is_postgres(target: Optional[Union[Path, str]] = None) -> bool:
+    """
+    Check if the target or default database is PostgreSQL.
+    Returns True if target string starts with postgres:// or postgresql://,
+    or if target is None and STORESHARE_DATABASE_URL is configured.
+    """
+    if target is not None:
+        target_str = str(target).strip().lower()
+        return target_str.startswith("postgres://") or target_str.startswith("postgresql://")
+    return get_database_url() is not None
+
+
 def get_db_path() -> Path:
     """
-    Get the configured database path.
+    Get the configured SQLite database path.
     Can be overridden via STORESHARE_DB_PATH (e.g., during tests).
     Defaults to data/storeshare.db relative to the project root.
     """
@@ -33,6 +74,28 @@ def get_db_path() -> Path:
 DB_PATH: Path = get_db_path()
 
 
+def get_database_info(target: Optional[Union[Path, str]] = None) -> Dict[str, Any]:
+    """
+    Return human-readable metadata describing the active database engine and target,
+    with sensitive credentials securely masked.
+    """
+    if is_postgres(target):
+        raw_url = str(target) if target else (get_database_url() or "")
+        masked = re.sub(r":([^:@]+)@", ":****@", raw_url)
+        return {
+            "engine": "PostgreSQL",
+            "driver": "psycopg",
+            "target": masked,
+        }
+    else:
+        path = Path(target) if (target and not is_postgres(target)) else get_db_path()
+        return {
+            "engine": "SQLite",
+            "driver": "sqlite3",
+            "target": str(path),
+        }
+
+
 def normalize_email(email: str) -> str:
     """
     Normalize email address to lowercase and trimmed string.
@@ -40,200 +103,495 @@ def normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
-def get_db_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
+class DatabaseCursor:
     """
-    Open and return a connection to the SQLite database.
-    Ensures the target directory exists before connecting.
-    Enforces foreign key constraints.
+    Unified database cursor wrapper providing cross-dialect query adaptation,
+    parameter translation (? -> %s), scalar function adaptation (MAX -> GREATEST),
+    and consistent generated ID capture across PostgreSQL and SQLite.
     """
-    target_path = db_path or get_db_path()
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(target_path))
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.row_factory = sqlite3.Row
-    return conn
+
+    def __init__(self, raw_cursor, is_pg: bool):
+        self._cursor = raw_cursor
+        self.is_pg = is_pg
+        self.lastrowid = getattr(raw_cursor, "lastrowid", None)
+
+    def execute(self, sql: str, params: Optional[Union[tuple, list, dict]] = None):
+        adapted_sql = sql
+        if self.is_pg:
+            # Bypass SQLite file-level lock commands on PostgreSQL
+            if "BEGIN IMMEDIATE" in adapted_sql:
+                return self
+
+            # Adapt parameter placeholders from SQLite '?' to PostgreSQL '%s'
+            if "?" in adapted_sql:
+                adapted_sql = adapted_sql.replace("?", "%s")
+
+            # Adapt scalar clamping from SQLite MAX(0, ...) to PostgreSQL GREATEST(0, ...)
+            if "MAX(0," in adapted_sql or "MAX(0 ," in adapted_sql:
+                adapted_sql = re.sub(r"MAX\s*\(\s*0\s*,", "GREATEST(0,", adapted_sql, flags=re.IGNORECASE)
+
+            # Auto-capture generated primary key via RETURNING id strictly for INSERT queries on tables with 'id'
+            is_insert = adapted_sql.strip().upper().startswith("INSERT INTO")
+            has_returning = "RETURNING" in adapted_sql.upper()
+            has_id_pk = "APP_METADATA" not in adapted_sql.upper()
+            auto_returning_for_insert = False
+
+            if is_insert and not has_returning and has_id_pk:
+                adapted_sql = adapted_sql.rstrip().rstrip(";") + " RETURNING id;"
+                auto_returning_for_insert = True
+
+            self._cursor.execute(adapted_sql, params or ())
+
+            if is_insert and (auto_returning_for_insert or has_returning):
+                try:
+                    row = self._cursor.fetchone()
+                    if row is not None:
+                        if isinstance(row, dict):
+                            self.lastrowid = row.get("id")
+                        elif hasattr(row, "__getitem__"):
+                            self.lastrowid = row[0]
+                except Exception:
+                    pass
+        else:
+            self._cursor.execute(adapted_sql, params or ())
+            self.lastrowid = self._cursor.lastrowid
+
+        return self
+
+    def fetchone(self) -> Optional[Dict[str, Any]]:
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def fetchall(self) -> List[Dict[str, Any]]:
+        rows = self._cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    @property
+    def rowcount(self) -> int:
+        return self._cursor.rowcount
+
+    def close(self) -> None:
+        if hasattr(self._cursor, "close"):
+            self._cursor.close()
 
 
-def init_db(db_path: Optional[Path] = None) -> None:
+class DatabaseConnection:
     """
-    Initialize SQLite database and create all required application tables.
-    Seeds default project metadata if not already present.
+    Unified database connection context manager supporting both PostgreSQL
+    (via psycopg with dict_row) and SQLite (via sqlite3 with Row).
+    """
+
+    def __init__(self, raw_conn, is_pg: bool):
+        self.conn = raw_conn
+        self.is_pg = is_pg
+
+    def cursor(self) -> DatabaseCursor:
+        raw_cur = self.conn.cursor()
+        return DatabaseCursor(raw_cur, self.is_pg)
+
+    def execute(self, sql: str, params: Optional[Union[tuple, list, dict]] = None) -> DatabaseCursor:
+        cur = self.cursor()
+        return cur.execute(sql, params)
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def rollback(self) -> None:
+        self.conn.rollback()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            try:
+                self.rollback()
+            except Exception:
+                pass
+        else:
+            try:
+                self.commit()
+            except Exception:
+                pass
+        self.close()
+
+
+@contextmanager
+def get_db_connection(db_path: Optional[Union[Path, str]] = None):
+    """
+    Open and yield a unified database connection supporting both PostgreSQL and SQLite.
+    Ensures safe commit on clean exit, rollback on error, and reliable connection closure.
+    """
+    if is_postgres(db_path):
+        if not PSYCOPG_AVAILABLE:
+            raise RuntimeError(
+                "PostgreSQL driver 'psycopg' is not available. Please install 'psycopg[binary]'."
+            )
+        url = str(db_path) if db_path else get_database_url()
+        raw_conn = psycopg.connect(url, row_factory=dict_row)
+        wrapper = DatabaseConnection(raw_conn, is_pg=True)
+        try:
+            yield wrapper
+        finally:
+            wrapper.close()
+    else:
+        target_path = Path(db_path) if (db_path and not is_postgres(db_path)) else get_db_path()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_conn = sqlite3.connect(str(target_path))
+        raw_conn.execute("PRAGMA foreign_keys = ON;")
+        raw_conn.row_factory = sqlite3.Row
+        wrapper = DatabaseConnection(raw_conn, is_pg=False)
+        try:
+            yield wrapper
+        finally:
+            wrapper.close()
+
+
+# ==============================================================================
+# Database Initialization & DDL Schemas
+# ==============================================================================
+
+def _init_postgres_db(conn: DatabaseConnection) -> None:
+    """
+    Initialize PostgreSQL tables, constraints, foreign keys, and indexes.
+    """
+    cursor = conn.cursor()
+    # 1. Foundation metadata table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key VARCHAR(128) PRIMARY KEY,
+            value TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cursor.execute(
+        """
+        INSERT INTO app_metadata (key, value)
+        VALUES 
+            ('project_name', 'Store-Share'),
+            ('phase', 'Day 1 Foundation'),
+            ('database_driver', 'PostgreSQL')
+        ON CONFLICT (key) DO NOTHING;
+        """
+    )
+
+    # 2. Users table for authentication
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGSERIAL PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            role VARCHAR(32) NOT NULL CHECK (role IN ('CONSUMER', 'PROVIDER', 'ADMIN')),
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+        """
+    )
+
+    # 3. Provider nodes table for storage allocation tracking
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS provider_nodes (
+            id BIGSERIAL PRIMARY KEY,
+            provider_id BIGINT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+            storage_dir TEXT,
+            quota_bytes BIGINT NOT NULL DEFAULT 0,
+            used_bytes BIGINT NOT NULL DEFAULT 0,
+            reserved_bytes BIGINT NOT NULL DEFAULT 0,
+            status VARCHAR(32) NOT NULL DEFAULT 'UNREGISTERED' CHECK (status IN ('UNREGISTERED', 'ONLINE', 'OFFLINE', 'STOPPED')),
+            last_heartbeat TIMESTAMPTZ,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_provider_nodes_provider_id ON provider_nodes(provider_id);
+        """
+    )
+
+    # 4. Files metadata table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+            id BIGSERIAL PRIMARY KEY,
+            owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            filename VARCHAR(512) NOT NULL,
+            file_size BIGINT NOT NULL,
+            encrypted_size BIGINT NOT NULL,
+            iv_hex VARCHAR(64) NOT NULL,
+            sha256_hash VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'PENDING_UPLOAD' CHECK (status IN ('PENDING_UPLOAD', 'UPLOADING', 'STORED', 'FAILED', 'DELETED')),
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_files_owner_id ON files(owner_id);
+        """
+    )
+
+    # 5. File chunks mapping
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_chunks (
+            id BIGSERIAL PRIMARY KEY,
+            file_id BIGINT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            chunk_id VARCHAR(128) NOT NULL UNIQUE,
+            provider_node_id BIGINT NOT NULL REFERENCES provider_nodes(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL DEFAULT 0,
+            chunk_size BIGINT NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'STORED', 'FAILED')),
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id ON file_chunks(file_id);
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_file_chunks_node_id ON file_chunks(provider_node_id);
+        """
+    )
+
+    # 6. Asynchronous Provider Chunk Job Queue (NAT-friendly polling)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chunk_jobs (
+            id BIGSERIAL PRIMARY KEY,
+            provider_node_id BIGINT NOT NULL REFERENCES provider_nodes(id) ON DELETE CASCADE,
+            chunk_id VARCHAR(128) NOT NULL,
+            file_id BIGINT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            job_type VARCHAR(32) NOT NULL CHECK (job_type IN ('STORE_CHUNK', 'RETRIEVE_CHUNK', 'DELETE_CHUNK')),
+            status VARCHAR(32) NOT NULL DEFAULT 'QUEUED' CHECK (status IN ('QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'TIMED_OUT')),
+            expires_at TIMESTAMPTZ NOT NULL,
+            error_message TEXT,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_chunk_jobs_node_status ON chunk_jobs(provider_node_id, status);
+        """
+    )
+    conn.commit()
+
+
+def _init_sqlite_db(conn: DatabaseConnection) -> None:
+    """
+    Initialize SQLite tables, constraints, foreign keys, and indexes.
+    """
+    cursor = conn.cursor()
+    # 1. Foundation metadata table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO app_metadata (key, value)
+        VALUES 
+            ('project_name', 'Store-Share'),
+            ('phase', 'Day 1 Foundation'),
+            ('database_driver', 'SQLite')
+        ;
+        """
+    )
+
+    # 2. Users table for authentication
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('CONSUMER', 'PROVIDER', 'ADMIN')),
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+        """
+    )
+
+    # 3. Provider nodes table for storage allocation tracking
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS provider_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL UNIQUE,
+            storage_dir TEXT,
+            quota_bytes INTEGER NOT NULL DEFAULT 0,
+            used_bytes INTEGER NOT NULL DEFAULT 0,
+            reserved_bytes INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'UNREGISTERED' CHECK (status IN ('UNREGISTERED', 'ONLINE', 'OFFLINE', 'STOPPED')),
+            last_heartbeat TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (provider_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_provider_nodes_provider_id ON provider_nodes(provider_id);
+        """
+    )
+
+    # 4. Files metadata table
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            encrypted_size INTEGER NOT NULL,
+            iv_hex TEXT NOT NULL,
+            sha256_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING_UPLOAD' CHECK (status IN ('PENDING_UPLOAD', 'UPLOADING', 'STORED', 'FAILED', 'DELETED')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_files_owner_id ON files(owner_id);
+        """
+    )
+
+    # 5. File chunks mapping
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            chunk_id TEXT NOT NULL UNIQUE,
+            provider_node_id INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL DEFAULT 0,
+            chunk_size INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'STORED', 'FAILED')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY (provider_node_id) REFERENCES provider_nodes(id) ON DELETE CASCADE
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id ON file_chunks(file_id);
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_file_chunks_node_id ON file_chunks(provider_node_id);
+        """
+    )
+
+    # 6. Asynchronous Provider Chunk Job Queue (NAT-friendly polling)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chunk_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_node_id INTEGER NOT NULL,
+            chunk_id TEXT NOT NULL,
+            file_id INTEGER NOT NULL,
+            job_type TEXT NOT NULL CHECK (job_type IN ('STORE_CHUNK', 'RETRIEVE_CHUNK', 'DELETE_CHUNK')),
+            status TEXT NOT NULL DEFAULT 'QUEUED' CHECK (status IN ('QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'TIMED_OUT')),
+            expires_at TIMESTAMP NOT NULL,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (provider_node_id) REFERENCES provider_nodes(id) ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_chunk_jobs_node_status ON chunk_jobs(provider_node_id, status);
+        """
+    )
+    conn.commit()
+
+
+def init_db(db_path: Optional[Union[Path, str]] = None) -> None:
+    """
+    Initialize database and create all required application tables and indexes.
+    Automatically executes the appropriate dialect DDL for PostgreSQL or SQLite.
+    """
+    with get_db_connection(db_path) as conn:
+        if conn.is_pg:
+            _init_postgres_db(conn)
+        else:
+            _init_sqlite_db(conn)
+
+
+def get_table_names(db_path: Optional[Union[Path, str]] = None) -> List[str]:
+    """
+    Return a read-only list of table names in the database.
+    Compatible with both PostgreSQL and SQLite.
     """
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
-        # 1. Foundation metadata table
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        cursor.execute(
-            """
-            INSERT OR IGNORE INTO app_metadata (key, value)
-            VALUES 
-                ('project_name', 'Store-Share'),
-                ('phase', 'Day 1 Foundation'),
-                ('database_driver', 'SQLite')
-            ;
-            """
-        )
-
-        # 2. Users table for authentication
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL CHECK (role IN ('CONSUMER', 'PROVIDER', 'ADMIN')),
-                is_active INTEGER NOT NULL DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-            """
-        )
-
-        # 3. Provider nodes table for storage allocation tracking
-        cursor.execute("PRAGMA table_info(provider_nodes);")
-        existing_cols = [row["name"] for row in cursor.fetchall()]
-        if existing_cols and "storage_dir" not in existing_cols:
-            cursor.execute("DROP TABLE provider_nodes;")
-            existing_cols = []
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS provider_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                provider_id INTEGER NOT NULL UNIQUE,
-                storage_dir TEXT,
-                quota_bytes INTEGER NOT NULL DEFAULT 0,
-                used_bytes INTEGER NOT NULL DEFAULT 0,
-                reserved_bytes INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'UNREGISTERED' CHECK (status IN ('UNREGISTERED', 'ONLINE', 'OFFLINE', 'STOPPED')),
-                last_heartbeat TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (provider_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_provider_nodes_provider_id ON provider_nodes(provider_id);
-            """
-        )
-
-        # Ensure reserved_bytes column exists if table was created in an earlier migration
-        if existing_cols and "reserved_bytes" not in existing_cols:
-            cursor.execute("ALTER TABLE provider_nodes ADD COLUMN reserved_bytes INTEGER NOT NULL DEFAULT 0;")
-
-        # 4. Files metadata table
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL,
-                filename TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                encrypted_size INTEGER NOT NULL,
-                iv_hex TEXT NOT NULL,
-                sha256_hash TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'PENDING_UPLOAD' CHECK (status IN ('PENDING_UPLOAD', 'UPLOADING', 'STORED', 'FAILED', 'DELETED')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_files_owner_id ON files(owner_id);
-            """
-        )
-
-        # 5. File chunks mapping
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS file_chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id INTEGER NOT NULL,
-                chunk_id TEXT NOT NULL UNIQUE,
-                provider_node_id INTEGER NOT NULL,
-                chunk_index INTEGER NOT NULL DEFAULT 0,
-                chunk_size INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'STORED', 'FAILED')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
-                FOREIGN KEY (provider_node_id) REFERENCES provider_nodes(id) ON DELETE CASCADE
-            );
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id ON file_chunks(file_id);
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_file_chunks_node_id ON file_chunks(provider_node_id);
-            """
-        )
-
-        # 6. Asynchronous Provider Chunk Job Queue (NAT-friendly polling)
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chunk_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                provider_node_id INTEGER NOT NULL,
-                chunk_id TEXT NOT NULL,
-                file_id INTEGER NOT NULL,
-                job_type TEXT NOT NULL CHECK (job_type IN ('STORE_CHUNK', 'RETRIEVE_CHUNK', 'DELETE_CHUNK')),
-                status TEXT NOT NULL DEFAULT 'QUEUED' CHECK (status IN ('QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'TIMED_OUT')),
-                expires_at TIMESTAMP NOT NULL,
-                error_message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (provider_node_id) REFERENCES provider_nodes(id) ON DELETE CASCADE,
-                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
-            );
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_chunk_jobs_node_status ON chunk_jobs(provider_node_id, status);
-            """
-        )
-        conn.commit()
-
-
-def get_table_names(db_path: Optional[Path] = None) -> List[str]:
-    """
-    Return a read-only list of table names in the SQLite database.
-    Excludes internal SQLite schema tables.
-    """
-    with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT name 
-            FROM sqlite_master 
-            WHERE type='table' AND name NOT LIKE 'sqlite_%'
-            ORDER BY name ASC;
-            """
-        )
+        if conn.is_pg:
+            cursor.execute(
+                """
+                SELECT table_name AS name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                ORDER BY table_name ASC;
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT name 
+                FROM sqlite_master 
+                WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name ASC;
+                """
+            )
         rows = cursor.fetchall()
         return [row["name"] for row in rows]
 
 
-def get_user_by_email(email: str, db_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+# ==============================================================================
+# User Accounts & Authentication Helpers
+# ==============================================================================
+
+def get_user_by_email(email: str, db_path: Optional[Union[Path, str]] = None) -> Optional[Dict[str, Any]]:
     """
     Fetch a user by normalized email address using parameterized SQL.
     Returns None if user does not exist.
@@ -255,7 +613,7 @@ def get_user_by_email(email: str, db_path: Optional[Path] = None) -> Optional[Di
         return None
 
 
-def get_user_by_id(user_id: int, db_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+def get_user_by_id(user_id: int, db_path: Optional[Union[Path, str]] = None) -> Optional[Dict[str, Any]]:
     """
     Fetch a user by numeric ID using parameterized SQL.
     Returns None if user does not exist.
@@ -281,7 +639,7 @@ def create_user(
     password_hash: str,
     role: str = "CONSUMER",
     is_active: bool = True,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Dict[str, Any]:
     """
     Insert a new user record using parameterized SQL.
@@ -298,7 +656,7 @@ def create_user(
             INSERT INTO users (email, password_hash, role, is_active)
             VALUES (?, ?, ?, ?);
             """,
-            (normalized, password_hash, role, 1 if is_active else 0),
+            (normalized, password_hash, role, bool(is_active)),
         )
         user_id = cursor.lastrowid
         conn.commit()
@@ -309,7 +667,11 @@ def create_user(
     return created
 
 
-def get_provider_node(provider_id: int, db_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+# ==============================================================================
+# Provider Node Telemetry & Allocation Helpers
+# ==============================================================================
+
+def get_provider_node(provider_id: int, db_path: Optional[Union[Path, str]] = None) -> Optional[Dict[str, Any]]:
     """
     Retrieve provider node record by provider user ID.
     Returns None if node has not been initialized.
@@ -335,11 +697,11 @@ def upsert_provider_node(
     quota_bytes: int,
     storage_dir: Optional[str] = None,
     status: str = "UNREGISTERED",
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Dict[str, Any]:
     """
     Create or update provider node storage settings.
-    Uses parameterized SQL to prevent injection.
+    Uses parameterized SQL and cross-engine ON CONFLICT upsert.
     """
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -347,10 +709,10 @@ def upsert_provider_node(
             """
             INSERT INTO provider_nodes (provider_id, storage_dir, quota_bytes, status, updated_at)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(provider_id) DO UPDATE SET
-                storage_dir = COALESCE(excluded.storage_dir, provider_nodes.storage_dir),
-                quota_bytes = excluded.quota_bytes,
-                status = excluded.status,
+            ON CONFLICT (provider_id) DO UPDATE SET
+                storage_dir = COALESCE(EXCLUDED.storage_dir, provider_nodes.storage_dir),
+                quota_bytes = EXCLUDED.quota_bytes,
+                status = EXCLUDED.status,
                 updated_at = CURRENT_TIMESTAMP;
             """,
             (provider_id, storage_dir, quota_bytes, status),
@@ -367,7 +729,7 @@ def record_provider_heartbeat(
     provider_id: int,
     used_bytes: int,
     allocated_bytes: int,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Record agent heartbeat: updates last_heartbeat to now and marks status ONLINE.
@@ -394,7 +756,7 @@ def record_provider_heartbeat(
 def set_provider_node_status(
     provider_id: int,
     status: str,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Update status of provider node (e.g. STOPPED, OFFLINE, ONLINE).
@@ -418,7 +780,7 @@ def set_provider_node_status(
     return get_provider_node(provider_id, db_path=db_path)
 
 
-def get_provider_node_by_id(node_id: int, db_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+def get_provider_node_by_id(node_id: int, db_path: Optional[Union[Path, str]] = None) -> Optional[Dict[str, Any]]:
     """
     Retrieve provider node record by primary key ID.
     """
@@ -473,7 +835,7 @@ def compute_node_effective_status(
 
 def find_eligible_provider_node(
     required_bytes: int,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
     heartbeat_timeout_seconds: int = 60,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -508,7 +870,7 @@ def find_eligible_provider_node(
 def reserve_provider_quota(
     provider_node_id: int,
     num_bytes: int,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> bool:
     """
     Transactionally reserve storage quota for an upcoming chunk upload.
@@ -537,7 +899,7 @@ def reserve_provider_quota(
 def commit_provider_quota(
     provider_node_id: int,
     num_bytes: int,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> bool:
     """
     Commit reserved quota to used_bytes when chunk storage is physically confirmed by provider.
@@ -561,7 +923,7 @@ def commit_provider_quota(
 def release_provider_quota(
     provider_node_id: int,
     num_bytes: int,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> bool:
     """
     Release reserved quota if a transfer fails, times out, or cancels.
@@ -592,7 +954,7 @@ def create_file_record(
     encrypted_size: int,
     iv_hex: str,
     sha256_hash: str,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new consumer file record with status 'PENDING_UPLOAD'.
@@ -643,7 +1005,7 @@ def create_file_record(
 def get_file_by_id(
     file_id: int,
     owner_id: Optional[int] = None,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Retrieve file record by ID. If owner_id is specified, strictly enforces ownership.
@@ -676,7 +1038,7 @@ def get_file_by_id(
 
 def list_consumer_files(
     owner_id: int,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     List non-deleted files owned by the specified consumer.
@@ -698,7 +1060,7 @@ def list_consumer_files(
 def update_file_status(
     file_id: int,
     status: str,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Update file processing status.
@@ -728,7 +1090,7 @@ def create_file_chunk(
     provider_node_id: int,
     chunk_size: int,
     chunk_index: int = 0,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a chunk placement record mapping a file chunk to a provider node.
@@ -756,7 +1118,7 @@ def create_file_chunk(
 
 def get_file_chunks(
     file_id: int,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get all chunk placement records for a file ordered by chunk_index.
@@ -777,7 +1139,7 @@ def get_file_chunks(
 
 def get_chunk_by_id(
     chunk_id: str,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Retrieve a chunk placement record by chunk ID string.
@@ -801,7 +1163,7 @@ def get_chunk_by_id(
 def update_chunk_status(
     chunk_id: str,
     status: str,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Update chunk placement status.
@@ -834,7 +1196,7 @@ def create_chunk_job(
     file_id: int,
     job_type: str,
     timeout_seconds: int = 60,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Dict[str, Any]:
     """
     Queue an asynchronous chunk transfer job for a provider node.
@@ -843,7 +1205,7 @@ def create_chunk_job(
         raise ValueError(f"Invalid job type: {job_type}")
 
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
-    expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+    expires_val = expires_at if is_postgres(db_path) else expires_at.strftime("%Y-%m-%d %H:%M:%S")
 
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -852,7 +1214,7 @@ def create_chunk_job(
             INSERT INTO chunk_jobs (provider_node_id, chunk_id, file_id, job_type, status, expires_at)
             VALUES (?, ?, ?, ?, 'QUEUED', ?);
             """,
-            (provider_node_id, chunk_id, file_id, job_type, expires_str),
+            (provider_node_id, chunk_id, file_id, job_type, expires_val),
         )
         job_id = cursor.lastrowid
         conn.commit()
@@ -865,7 +1227,7 @@ def create_chunk_job(
 
 def get_chunk_job_by_id(
     job_id: int,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Retrieve a chunk job by ID.
@@ -889,7 +1251,7 @@ def get_chunk_job_by_id(
 def get_active_chunk_job(
     chunk_id: str,
     job_type: str,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Retrieve an active (QUEUED or PROCESSING) job for a specific chunk and job type.
@@ -918,52 +1280,79 @@ def get_active_chunk_job(
 def poll_provider_jobs(
     provider_node_id: int,
     limit: int = 5,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Poll queued, non-expired jobs assigned exclusively to the specified provider node.
     Transitions polled jobs to 'PROCESSING' to avoid duplicate dispatch.
+
+    In PostgreSQL: Uses atomic UPDATE with 'FOR UPDATE SKIP LOCKED' to guarantee
+    safe, non-blocking concurrent polling across multiple agent workers.
+    In SQLite: Uses 'BEGIN IMMEDIATE;' transaction lock.
     """
-    with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("BEGIN IMMEDIATE;")
-        cursor.execute(
-            """
-            SELECT id, provider_node_id, chunk_id, file_id, job_type, status, expires_at, error_message, created_at, updated_at
-            FROM chunk_jobs
-            WHERE provider_node_id = ?
-              AND status = 'QUEUED'
-              AND expires_at > CURRENT_TIMESTAMP
-            ORDER BY created_at ASC
-            LIMIT ?;
-            """,
-            (provider_node_id, limit),
-        )
-        jobs = [dict(r) for r in cursor.fetchall()]
-
-        if jobs:
-            job_ids = [j["id"] for j in jobs]
-            placeholders = ",".join("?" for _ in job_ids)
-            cursor.execute(
-                f"""
-                UPDATE chunk_jobs
-                SET status = 'PROCESSING',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id IN ({placeholders});
-                """,
-                job_ids,
+    if is_postgres(db_path):
+        with get_db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            query = """
+            UPDATE chunk_jobs
+            SET status = 'PROCESSING',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id IN (
+                SELECT id
+                FROM chunk_jobs
+                WHERE provider_node_id = %s
+                  AND status = 'QUEUED'
+                  AND expires_at > CURRENT_TIMESTAMP
+                ORDER BY created_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
             )
-            for j in jobs:
-                j["status"] = "PROCESSING"
-        conn.commit()
+            RETURNING id, provider_node_id, chunk_id, file_id, job_type, status, expires_at, error_message, created_at, updated_at;
+            """
+            cursor.execute(query, (provider_node_id, limit))
+            jobs = cursor.fetchall()
+            conn.commit()
+            return jobs
+    else:
+        with get_db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE;")
+            cursor.execute(
+                """
+                SELECT id, provider_node_id, chunk_id, file_id, job_type, status, expires_at, error_message, created_at, updated_at
+                FROM chunk_jobs
+                WHERE provider_node_id = ?
+                  AND status = 'QUEUED'
+                  AND expires_at > CURRENT_TIMESTAMP
+                ORDER BY created_at ASC
+                LIMIT ?;
+                """,
+                (provider_node_id, limit),
+            )
+            jobs = cursor.fetchall()
 
-    return jobs
+            if jobs:
+                job_ids = [j["id"] for j in jobs]
+                placeholders = ",".join("?" for _ in job_ids)
+                cursor.execute(
+                    f"""
+                    UPDATE chunk_jobs
+                    SET status = 'PROCESSING',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders});
+                    """,
+                    job_ids,
+                )
+                for j in jobs:
+                    j["status"] = "PROCESSING"
+            conn.commit()
+            return jobs
 
 
 def complete_chunk_job(
     job_id: int,
     provider_node_id: int,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> bool:
     """
     Acknowledge completion of a chunk transfer job.
@@ -1053,23 +1442,24 @@ def complete_chunk_job(
                     """,
                     (job["chunk_id"],),
                 )
+
+            cursor.execute(
+                """
+                SELECT count(*) as total FROM file_chunks WHERE file_id = ?;
+                """,
+                (job["file_id"],),
+            )
+            row = cursor.fetchone()
+            if row and row["total"] == 0:
                 cursor.execute(
                     """
-                    SELECT count(*) as total FROM file_chunks WHERE file_id = ?;
+                    UPDATE files
+                    SET status = 'DELETED',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?;
                     """,
                     (job["file_id"],),
                 )
-                row = cursor.fetchone()
-                if row and row["total"] == 0:
-                    cursor.execute(
-                        """
-                        UPDATE files
-                        SET status = 'DELETED',
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?;
-                        """,
-                        (job["file_id"],),
-                    )
 
         conn.commit()
 
@@ -1084,7 +1474,7 @@ def fail_chunk_job(
     job_id: int,
     provider_node_id: int,
     error_message: str = "Job execution failed",
-    db_path: Optional[Path] = None,
+    db_path: Optional[Union[Path, str]] = None,
 ) -> bool:
     """
     Mark a chunk transfer job as FAILED and release any reserved quota.
@@ -1098,6 +1488,9 @@ def fail_chunk_job(
 
     if job["status"] == "COMPLETED":
         return False
+
+    if job["status"] == "FAILED":
+        return True
 
     chunk = get_chunk_by_id(job["chunk_id"], db_path=db_path)
 
@@ -1115,7 +1508,11 @@ def fail_chunk_job(
             (error_message, job_id),
         )
         if cursor.rowcount == 0:
+            cursor.execute("SELECT status FROM chunk_jobs WHERE id = ?;", (job_id,))
+            current = cursor.fetchone()
             conn.commit()
+            if current and current["status"] == "FAILED":
+                return True
             return False
 
         if job["job_type"] == "STORE_CHUNK":
@@ -1146,7 +1543,7 @@ def fail_chunk_job(
     return True
 
 
-def expire_stale_jobs(db_path: Optional[Path] = None) -> int:
+def expire_stale_jobs(db_path: Optional[Union[Path, str]] = None) -> int:
     """
     Reap all expired jobs past their expires_at timestamp.
     Transitions stale QUEUED/PROCESSING jobs to TIMED_OUT and cleans up file status and reserved quota.
@@ -1162,7 +1559,7 @@ def expire_stale_jobs(db_path: Optional[Path] = None) -> int:
               AND expires_at < CURRENT_TIMESTAMP;
             """
         )
-        stale_jobs = [dict(r) for r in cursor.fetchall()]
+        stale_jobs = cursor.fetchall()
 
         if not stale_jobs:
             return 0
@@ -1208,3 +1605,47 @@ def expire_stale_jobs(db_path: Optional[Path] = None) -> int:
                 release_provider_quota(j["provider_node_id"], chunk["chunk_size"], db_path=db_path)
 
     return len(stale_jobs)
+
+
+def cancel_pending_chunk_jobs_for_file(
+    file_id: int,
+    db_path: Optional[Union[Path, str]] = None,
+) -> int:
+    """
+    Cancel all queued or processing chunk jobs for a file.
+    """
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE chunk_jobs
+            SET status = 'FAILED',
+                error_message = 'Job cancelled due to file deletion',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE file_id = ? AND status IN ('QUEUED', 'PROCESSING');
+            """,
+            (file_id,),
+        )
+        count = cursor.rowcount
+        conn.commit()
+        return count
+
+
+def delete_file_chunks_for_file(
+    file_id: int,
+    db_path: Optional[Union[Path, str]] = None,
+) -> int:
+    """
+    Remove all chunk placement records for a file.
+    """
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            DELETE FROM file_chunks WHERE file_id = ?;
+            """,
+            (file_id,),
+        )
+        count = cursor.rowcount
+        conn.commit()
+        return count

@@ -14,7 +14,7 @@ load_dotenv()
 from backend.auth_router import router as auth_router
 from backend.consumer_router import router as consumer_router
 from backend.provider_router import router as provider_router
-from backend.database import expire_stale_jobs, get_db_path, get_table_names, init_db
+from backend.database import expire_stale_jobs, get_database_info, get_db_path, get_table_names, init_db
 from backend.spool import cleanup_all_spool
 
 # Configure logging
@@ -29,12 +29,13 @@ logger = logging.getLogger("store-share-backend")
 async def lifespan(app: FastAPI):
     """
     Application lifecycle manager: Initializes database and cleans transient spools on startup/shutdown.
+    Supports both PostgreSQL and SQLite based on configuration.
     """
-    db_file = get_db_path()
-    logger.info("Initializing Store-Share SQLite database...")
+    db_info = get_database_info()
+    logger.info(f"Initializing Store-Share database ({db_info['engine']})...")
     try:
         init_db()
-        logger.info(f"Database initialized successfully at: {db_file}")
+        logger.info(f"Database initialized successfully: {db_info['target']}")
         # Clean up any stale unacknowledged jobs and orphaned transient buffers from prior runs
         expired = expire_stale_jobs()
         if expired > 0:
@@ -96,7 +97,7 @@ def get_health() -> HealthResponse:
     Return backend system health and database connectivity status.
     """
     try:
-        # Verify read capability from SQLite
+        db_info = get_database_info()
         tables: List[str] = get_table_names()
         db_status = "connected" if "app_metadata" in tables else "initialized_without_metadata"
         return HealthResponse(
@@ -104,7 +105,7 @@ def get_health() -> HealthResponse:
             service="store-share-backend",
             version="0.2.0",
             database=db_status,
-            database_path=str(get_db_path()),
+            database_path=db_info["target"],
         )
     except Exception as exc:
         logger.error(f"Health check failed due to database error: {exc}", exc_info=True)
@@ -112,6 +113,7 @@ def get_health() -> HealthResponse:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Health check failed: {str(exc)}",
         )
+
 
 
 @app.get("/db/tables", response_model=TablesResponse, tags=["Database"])

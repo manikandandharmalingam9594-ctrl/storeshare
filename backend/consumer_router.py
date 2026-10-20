@@ -24,10 +24,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from backend.database import (
     MAX_FILE_SIZE_BYTES,
+    cancel_pending_chunk_jobs_for_file,
     compute_node_effective_status,
     create_chunk_job,
     create_file_chunk,
     create_file_record,
+    delete_file_chunks_for_file,
     expire_stale_jobs,
     find_eligible_provider_node,
     get_active_chunk_job,
@@ -448,8 +450,14 @@ async def delete_file(
     ensures committed quota is accurately released, and marks file as DELETED.
     Never reports success before physical deletion is confirmed.
     """
-    file_rec = get_file_by_id(file_id, owner_id=consumer_user["id"])
+    file_rec = get_file_by_id(file_id)
     if not file_rec:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    if file_rec["owner_id"] != consumer_user["id"]:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File not found or access denied.",
@@ -465,6 +473,15 @@ async def delete_file(
     chunks = get_file_chunks(file_id)
 
     if file_rec["status"] == "STORED":
+        if not chunks:
+            update_file_status(file_id, "DELETED")
+            return FileDeleteResponse(
+                file_id=file_id,
+                status="DELETED",
+                message="File metadata marked as deleted (no remaining physical chunks).",
+            )
+
+        # Pre-validate that all assigned provider nodes are ONLINE before queuing any delete jobs
         for chunk in chunks:
             provider_node = get_provider_node_by_id(chunk["provider_node_id"])
             if not provider_node or compute_node_effective_status(provider_node) != "ONLINE":
@@ -473,20 +490,25 @@ async def delete_file(
                     detail="Assigned storage provider node is currently offline. Cannot confirm physical deletion.",
                 )
 
-            # Queue DELETE_CHUNK job
-            job = create_chunk_job(
-                provider_node_id=chunk["provider_node_id"],
-                chunk_id=chunk["chunk_id"],
-                file_id=file_id,
-                job_type="DELETE_CHUNK",
-                timeout_seconds=20,
-            )
+        # Coordinate physical chunk deletion across provider nodes
+        for chunk in chunks:
+            job = get_active_chunk_job(chunk["chunk_id"], "DELETE_CHUNK")
+            if not job:
+                job = create_chunk_job(
+                    provider_node_id=chunk["provider_node_id"],
+                    chunk_id=chunk["chunk_id"],
+                    file_id=file_id,
+                    job_type="DELETE_CHUNK",
+                    timeout_seconds=20,
+                )
 
-            # Await provider confirmation (up to 10 seconds)
-            for _ in range(50):
+            # Await provider confirmation (up to 15 seconds)
+            completed = False
+            for _ in range(75):
                 await asyncio.sleep(0.2)
                 j_rec = get_chunk_job_by_id(job["id"])
                 if j_rec and j_rec["status"] == "COMPLETED":
+                    completed = True
                     break
                 if j_rec and j_rec["status"] in ("FAILED", "TIMED_OUT"):
                     raise HTTPException(
@@ -494,8 +516,7 @@ async def delete_file(
                         detail=f"Provider failed to execute chunk deletion: {j_rec.get('error_message', 'Timeout')}",
                     )
 
-            j_rec = get_chunk_job_by_id(job["id"])
-            if not j_rec or j_rec["status"] != "COMPLETED":
+            if not completed:
                 raise HTTPException(
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                     detail="Storage provider node did not confirm chunk deletion in time.",
@@ -511,11 +532,13 @@ async def delete_file(
 
     else:
         # File was in PENDING_UPLOAD, UPLOADING, or FAILED:
-        # Purge any transient spool files and rollback quota reservation
+        # Purge any transient spool files, release quota, and cancel pending jobs
         for chunk in chunks:
             remove_spool_chunk(chunk["chunk_id"])
             release_provider_quota(chunk["provider_node_id"], chunk["chunk_size"])
 
+        cancel_pending_chunk_jobs_for_file(file_id)
+        delete_file_chunks_for_file(file_id)
         update_file_status(file_id, "DELETED")
         return FileDeleteResponse(
             file_id=file_id,

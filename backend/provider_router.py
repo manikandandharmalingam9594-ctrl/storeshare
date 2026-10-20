@@ -406,6 +406,14 @@ def fail_job_endpoint(
     if job["status"] == "COMPLETED":
         raise HTTPException(status.HTTP_409_CONFLICT, "Cannot fail an already completed job.")
 
+    if job["status"] == "FAILED":
+        return {
+            "status": "FAILED",
+            "job_id": job_id,
+            "error_message": job.get("error_message"),
+            "idempotent": True,
+        }
+
     success = fail_chunk_job(
         job_id=job_id,
         provider_node_id=node["id"],
