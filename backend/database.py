@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import json
 import logging
 import os
 import re
@@ -311,8 +312,11 @@ def _init_postgres_db(conn: DatabaseConnection) -> None:
             quota_bytes BIGINT NOT NULL DEFAULT 0,
             used_bytes BIGINT NOT NULL DEFAULT 0,
             reserved_bytes BIGINT NOT NULL DEFAULT 0,
-            status VARCHAR(32) NOT NULL DEFAULT 'UNREGISTERED' CHECK (status IN ('UNREGISTERED', 'ONLINE', 'OFFLINE', 'STOPPED')),
+            free_disk_bytes BIGINT NOT NULL DEFAULT 0,
+            status VARCHAR(32) NOT NULL DEFAULT 'UNREGISTERED' CHECK (status IN ('UNREGISTERED', 'ONLINE', 'OFFLINE', 'STOPPED', 'PAUSED')),
             last_heartbeat TIMESTAMPTZ,
+            computer_name VARCHAR(255),
+            last_inventory TEXT,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
@@ -358,6 +362,8 @@ def _init_postgres_db(conn: DatabaseConnection) -> None:
             chunk_index INTEGER NOT NULL DEFAULT 0,
             chunk_size BIGINT NOT NULL,
             status VARCHAR(32) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'STORED', 'FAILED')),
+            sha256_hash VARCHAR(64),
+            last_verified_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
         """
@@ -395,6 +401,19 @@ def _init_postgres_db(conn: DatabaseConnection) -> None:
         CREATE INDEX IF NOT EXISTS idx_chunk_jobs_node_status ON chunk_jobs(provider_node_id, status);
         """
     )
+
+    # Safe schema migration for existing tables
+    cursor.execute("ALTER TABLE provider_nodes ADD COLUMN IF NOT EXISTS computer_name VARCHAR(255);")
+    cursor.execute("ALTER TABLE provider_nodes ADD COLUMN IF NOT EXISTS free_disk_bytes BIGINT NOT NULL DEFAULT 0;")
+    cursor.execute("ALTER TABLE provider_nodes ADD COLUMN IF NOT EXISTS last_inventory TEXT;")
+    cursor.execute("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMPTZ;")
+    cursor.execute("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS sha256_hash VARCHAR(64);")
+    try:
+        cursor.execute("ALTER TABLE provider_nodes DROP CONSTRAINT IF EXISTS provider_nodes_status_check;")
+        cursor.execute("ALTER TABLE provider_nodes ADD CONSTRAINT provider_nodes_status_check CHECK (status IN ('UNREGISTERED', 'ONLINE', 'OFFLINE', 'STOPPED', 'PAUSED'));")
+    except Exception as exc:
+        logger.warning(f"Could not update provider_nodes status check constraint: {exc}")
+
     conn.commit()
 
 
@@ -453,8 +472,11 @@ def _init_sqlite_db(conn: DatabaseConnection) -> None:
             quota_bytes INTEGER NOT NULL DEFAULT 0,
             used_bytes INTEGER NOT NULL DEFAULT 0,
             reserved_bytes INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'UNREGISTERED' CHECK (status IN ('UNREGISTERED', 'ONLINE', 'OFFLINE', 'STOPPED')),
+            free_disk_bytes INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'UNREGISTERED' CHECK (status IN ('UNREGISTERED', 'ONLINE', 'OFFLINE', 'STOPPED', 'PAUSED')),
             last_heartbeat TIMESTAMP,
+            computer_name TEXT,
+            last_inventory TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (provider_id) REFERENCES users(id) ON DELETE CASCADE
@@ -502,6 +524,8 @@ def _init_sqlite_db(conn: DatabaseConnection) -> None:
             chunk_index INTEGER NOT NULL DEFAULT 0,
             chunk_size INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'STORED', 'FAILED')),
+            sha256_hash TEXT,
+            last_verified_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
             FOREIGN KEY (provider_node_id) REFERENCES provider_nodes(id) ON DELETE CASCADE
@@ -543,6 +567,24 @@ def _init_sqlite_db(conn: DatabaseConnection) -> None:
         CREATE INDEX IF NOT EXISTS idx_chunk_jobs_node_status ON chunk_jobs(provider_node_id, status);
         """
     )
+
+    # Safe schema migration for existing SQLite tables
+    cursor.execute("PRAGMA table_info(provider_nodes);")
+    existing_pn_cols = [c["name"] for c in cursor.fetchall()]
+    if "computer_name" not in existing_pn_cols:
+        cursor.execute("ALTER TABLE provider_nodes ADD COLUMN computer_name TEXT;")
+    if "free_disk_bytes" not in existing_pn_cols:
+        cursor.execute("ALTER TABLE provider_nodes ADD COLUMN free_disk_bytes INTEGER NOT NULL DEFAULT 0;")
+    if "last_inventory" not in existing_pn_cols:
+        cursor.execute("ALTER TABLE provider_nodes ADD COLUMN last_inventory TEXT;")
+
+    cursor.execute("PRAGMA table_info(file_chunks);")
+    existing_fc_cols = [c["name"] for c in cursor.fetchall()]
+    if "last_verified_at" not in existing_fc_cols:
+        cursor.execute("ALTER TABLE file_chunks ADD COLUMN last_verified_at TIMESTAMP;")
+    if "sha256_hash" not in existing_fc_cols:
+        cursor.execute("ALTER TABLE file_chunks ADD COLUMN sha256_hash TEXT;")
+
     conn.commit()
 
 
@@ -680,7 +722,7 @@ def get_provider_node(provider_id: int, db_path: Optional[Union[Path, str]] = No
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, status, last_heartbeat, created_at, updated_at
+            SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, free_disk_bytes, status, last_heartbeat, computer_name, last_inventory, created_at, updated_at
             FROM provider_nodes
             WHERE provider_id = ?;
             """,
@@ -697,6 +739,9 @@ def upsert_provider_node(
     quota_bytes: int,
     storage_dir: Optional[str] = None,
     status: str = "UNREGISTERED",
+    computer_name: Optional[str] = None,
+    free_disk_bytes: int = 0,
+    last_inventory: Optional[str] = None,
     db_path: Optional[Union[Path, str]] = None,
 ) -> Dict[str, Any]:
     """
@@ -707,15 +752,18 @@ def upsert_provider_node(
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO provider_nodes (provider_id, storage_dir, quota_bytes, status, updated_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO provider_nodes (provider_id, storage_dir, quota_bytes, status, computer_name, free_disk_bytes, last_inventory, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (provider_id) DO UPDATE SET
                 storage_dir = COALESCE(EXCLUDED.storage_dir, provider_nodes.storage_dir),
                 quota_bytes = EXCLUDED.quota_bytes,
                 status = EXCLUDED.status,
+                computer_name = COALESCE(EXCLUDED.computer_name, provider_nodes.computer_name),
+                free_disk_bytes = CASE WHEN EXCLUDED.free_disk_bytes > 0 THEN EXCLUDED.free_disk_bytes ELSE provider_nodes.free_disk_bytes END,
+                last_inventory = COALESCE(EXCLUDED.last_inventory, provider_nodes.last_inventory),
                 updated_at = CURRENT_TIMESTAMP;
             """,
-            (provider_id, storage_dir, quota_bytes, status),
+            (provider_id, storage_dir, quota_bytes, status, computer_name, free_disk_bytes, last_inventory),
         )
         conn.commit()
 
@@ -729,25 +777,47 @@ def record_provider_heartbeat(
     provider_id: int,
     used_bytes: int,
     allocated_bytes: int,
+    computer_name: Optional[str] = None,
+    free_disk_bytes: int = 0,
+    inventory_json: Optional[str] = None,
     db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Record agent heartbeat: updates last_heartbeat to now and marks status ONLINE.
+    Record agent heartbeat: updates last_heartbeat, telemetry, and ensures ONLINE status unless PAUSED.
     """
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE provider_nodes
-            SET last_heartbeat = CURRENT_TIMESTAMP,
-                status = 'ONLINE',
-                used_bytes = ?,
-                quota_bytes = CASE WHEN quota_bytes = 0 THEN ? ELSE quota_bytes END,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE provider_id = ?;
-            """,
-            (used_bytes, allocated_bytes, provider_id),
-        )
+        if computer_name:
+            cursor.execute(
+                """
+                UPDATE provider_nodes
+                SET last_heartbeat = CURRENT_TIMESTAMP,
+                    status = CASE WHEN status = 'PAUSED' THEN 'PAUSED' ELSE 'ONLINE' END,
+                    used_bytes = ?,
+                    quota_bytes = CASE WHEN quota_bytes = 0 THEN ? ELSE quota_bytes END,
+                    computer_name = ?,
+                    free_disk_bytes = ?,
+                    last_inventory = COALESCE(?, last_inventory),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE provider_id = ?;
+                """,
+                (used_bytes, allocated_bytes, computer_name, free_disk_bytes, inventory_json, provider_id),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE provider_nodes
+                SET last_heartbeat = CURRENT_TIMESTAMP,
+                    status = CASE WHEN status = 'PAUSED' THEN 'PAUSED' ELSE 'ONLINE' END,
+                    used_bytes = ?,
+                    quota_bytes = CASE WHEN quota_bytes = 0 THEN ? ELSE quota_bytes END,
+                    free_disk_bytes = ?,
+                    last_inventory = COALESCE(?, last_inventory),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE provider_id = ?;
+                """,
+                (used_bytes, allocated_bytes, free_disk_bytes, inventory_json, provider_id),
+            )
         conn.commit()
 
     return get_provider_node(provider_id, db_path=db_path)
@@ -759,9 +829,9 @@ def set_provider_node_status(
     db_path: Optional[Union[Path, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Update status of provider node (e.g. STOPPED, OFFLINE, ONLINE).
+    Update status of provider node (e.g. STOPPED, PAUSED, OFFLINE, ONLINE).
     """
-    if status not in ("UNREGISTERED", "ONLINE", "OFFLINE", "STOPPED"):
+    if status not in ("UNREGISTERED", "ONLINE", "OFFLINE", "STOPPED", "PAUSED"):
         raise ValueError(f"Invalid node status: {status}")
 
     with get_db_connection(db_path) as conn:
@@ -788,7 +858,7 @@ def get_provider_node_by_id(node_id: int, db_path: Optional[Union[Path, str]] = 
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, status, last_heartbeat, created_at, updated_at
+            SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, free_disk_bytes, status, last_heartbeat, computer_name, last_inventory, created_at, updated_at
             FROM provider_nodes
             WHERE id = ?;
             """,
@@ -807,6 +877,7 @@ def compute_node_effective_status(
     """
     Compute real-time node operational status based on heartbeat freshness.
     If coordinator hasn't received a heartbeat within timeout, marks as OFFLINE.
+    Preserves STOPPED and PAUSED states cleanly.
     """
     raw_status = node.get("status", "UNREGISTERED")
     if raw_status in ("STOPPED", "UNREGISTERED"):
@@ -828,6 +899,8 @@ def compute_node_effective_status(
         age_seconds = (datetime.now(timezone.utc) - hb_time).total_seconds()
         if age_seconds > heartbeat_timeout_seconds:
             return "OFFLINE"
+        if raw_status == "PAUSED":
+            return "PAUSED"
         return "ONLINE"
     except Exception:
         return "OFFLINE"
@@ -841,15 +914,16 @@ def find_eligible_provider_node(
     """
     Find an ONLINE provider node that has sufficient available quota (quota - used - reserved).
     Heartbeat must be fresh (<= heartbeat_timeout_seconds ago).
+    Excludes STOPPED and PAUSED nodes.
     Returns the node with the highest available quota.
     """
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, status, last_heartbeat, created_at, updated_at
+            SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, free_disk_bytes, status, last_heartbeat, created_at, updated_at
             FROM provider_nodes
-            WHERE status != 'STOPPED'
+            WHERE status NOT IN ('STOPPED', 'PAUSED')
               AND storage_dir IS NOT NULL
               AND last_heartbeat IS NOT NULL
               AND (quota_bytes - used_bytes - reserved_bytes) >= ?
@@ -1127,7 +1201,7 @@ def get_file_chunks(
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, file_id, chunk_id, provider_node_id, chunk_index, chunk_size, status, created_at
+            SELECT id, file_id, chunk_id, provider_node_id, chunk_index, chunk_size, status, last_verified_at, created_at
             FROM file_chunks
             WHERE file_id = ?
             ORDER BY chunk_index ASC;
@@ -1148,7 +1222,7 @@ def get_chunk_by_id(
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, file_id, chunk_id, provider_node_id, chunk_index, chunk_size, status, created_at
+            SELECT id, file_id, chunk_id, provider_node_id, chunk_index, chunk_size, status, last_verified_at, created_at
             FROM file_chunks
             WHERE chunk_id = ?;
             """,
@@ -1280,6 +1354,7 @@ def get_active_chunk_job(
 def poll_provider_jobs(
     provider_node_id: int,
     limit: int = 5,
+    exclude_job_types: Optional[List[str]] = None,
     db_path: Optional[Union[Path, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -1290,10 +1365,21 @@ def poll_provider_jobs(
     safe, non-blocking concurrent polling across multiple agent workers.
     In SQLite: Uses 'BEGIN IMMEDIATE;' transaction lock.
     """
+    exclude_clause = ""
+    exclude_params: tuple = ()
+    if exclude_job_types:
+        placeholders_ex = ",".join("?" for _ in exclude_job_types)
+        exclude_clause = f"AND job_type NOT IN ({placeholders_ex})"
+        exclude_params = tuple(exclude_job_types)
+
     if is_postgres(db_path):
         with get_db_connection(db_path) as conn:
             cursor = conn.cursor()
-            query = """
+            pg_exclude_clause = ""
+            if exclude_job_types:
+                pg_placeholders = ",".join("%s" for _ in exclude_job_types)
+                pg_exclude_clause = f"AND job_type NOT IN ({pg_placeholders})"
+            query = f"""
             UPDATE chunk_jobs
             SET status = 'PROCESSING',
                 updated_at = CURRENT_TIMESTAMP
@@ -1303,13 +1389,14 @@ def poll_provider_jobs(
                 WHERE provider_node_id = %s
                   AND status = 'QUEUED'
                   AND expires_at > CURRENT_TIMESTAMP
+                  {pg_exclude_clause}
                 ORDER BY created_at ASC
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING id, provider_node_id, chunk_id, file_id, job_type, status, expires_at, error_message, created_at, updated_at;
             """
-            cursor.execute(query, (provider_node_id, limit))
+            cursor.execute(query, (provider_node_id, *exclude_params, limit))
             jobs = cursor.fetchall()
             conn.commit()
             return jobs
@@ -1318,16 +1405,17 @@ def poll_provider_jobs(
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE;")
             cursor.execute(
-                """
+                f"""
                 SELECT id, provider_node_id, chunk_id, file_id, job_type, status, expires_at, error_message, created_at, updated_at
                 FROM chunk_jobs
                 WHERE provider_node_id = ?
                   AND status = 'QUEUED'
                   AND expires_at > CURRENT_TIMESTAMP
+                  {exclude_clause}
                 ORDER BY created_at ASC
                 LIMIT ?;
                 """,
-                (provider_node_id, limit),
+                (provider_node_id, *exclude_params, limit),
             )
             jobs = cursor.fetchall()
 
@@ -1649,3 +1737,634 @@ def delete_file_chunks_for_file(
         count = cursor.rowcount
         conn.commit()
         return count
+
+
+def update_chunk_verification(
+    provider_node_id: int,
+    chunk_ids: List[str],
+    db_path: Optional[Union[Path, str]] = None,
+) -> int:
+    """
+    Update last_verified_at timestamp for chunks confirmed physically present on provider host.
+    Uses parameterized query compatible with PostgreSQL and SQLite.
+    """
+    if not chunk_ids:
+        return 0
+
+    valid_chunk_ids = [cid for cid in chunk_ids if CHUNK_ID_PATTERN.match(cid)]
+    if not valid_chunk_ids:
+        return 0
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        placeholders = ",".join(["?"] * len(valid_chunk_ids))
+        cursor.execute(
+            f"""
+            UPDATE file_chunks
+            SET last_verified_at = CURRENT_TIMESTAMP
+            WHERE provider_node_id = ? AND chunk_id IN ({placeholders});
+            """,
+            [provider_node_id] + list(valid_chunk_ids),
+        )
+        count = cursor.rowcount
+        conn.commit()
+        return count
+
+
+def get_provider_job_telemetry(
+    provider_node_id: int,
+    limit: int = 20,
+    db_path: Optional[Union[Path, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Retrieve telemetry statistics and recent execution history for a provider node.
+    Returns counts for active, completed, and failed jobs, along with recent job logs.
+    """
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT 
+                COUNT(CASE WHEN status IN ('QUEUED', 'PROCESSING') THEN 1 END) AS active_jobs,
+                COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END) AS completed_jobs,
+                COUNT(CASE WHEN status IN ('FAILED', 'TIMED_OUT') THEN 1 END) AS failed_jobs
+            FROM chunk_jobs
+            WHERE provider_node_id = ?;
+            """,
+            (provider_node_id,),
+        )
+        counts = cursor.fetchone() or {}
+
+        cursor.execute(
+            """
+            SELECT id, provider_node_id, chunk_id, file_id, job_type, status, error_message, created_at, updated_at
+            FROM chunk_jobs
+            WHERE provider_node_id = ?
+            ORDER BY id DESC
+            LIMIT ?;
+            """,
+            (provider_node_id, limit),
+        )
+        recent_rows = cursor.fetchall()
+
+    recent_jobs = [
+        {
+            "id": r["id"],
+            "provider_node_id": r["provider_node_id"],
+            "chunk_id": r["chunk_id"],
+            "file_id": r["file_id"],
+            "job_type": r["job_type"],
+            "status": r["status"],
+            "error_message": r.get("error_message"),
+            "created_at": str(r["created_at"]) if r.get("created_at") else None,
+            "updated_at": str(r["updated_at"]) if r.get("updated_at") else None,
+        }
+        for r in recent_rows
+    ]
+
+    return {
+        "active_jobs": counts.get("active_jobs", 0) if isinstance(counts, dict) else (counts[0] if counts else 0),
+        "completed_jobs": counts.get("completed_jobs", 0) if isinstance(counts, dict) else (counts[1] if counts else 0),
+        "failed_jobs": counts.get("failed_jobs", 0) if isinstance(counts, dict) else (counts[2] if counts else 0),
+        "recent_jobs": recent_jobs,
+    }
+
+
+def get_provider_reconciliation_records(
+    provider_node_id: int,
+    db_path: Optional[Union[Path, str]] = None,
+    heartbeat_timeout_seconds: int = 60,
+    verification_freshness_seconds: int = 90,
+) -> Dict[str, Any]:
+    """
+    Reconciles physical chunk storage on provider host with coordinator metadata.
+    Compares:
+    1. Expected chunks registered to this provider node.
+    2. Actual physical chunk files reported by provider agent (IDs, sizes, SHA-256 hashes).
+
+    Categorizes every chunk into one of 5 distinct states:
+    - VERIFIED: physically exists on provider disk, byte size and SHA-256 hash match metadata.
+    - MISSING: expected by coordinator, but chunk file is absent on provider disk.
+    - CORRUPTED: exists on disk, but byte size or cryptographic checksum does not match expected metadata.
+    - UNEXPECTED: exists on provider disk, but coordinator has no record of it belonging to this node.
+    - UNVERIFIED: assigned in coordinator, but provider node is offline or physical presence unverified.
+    """
+    node = get_provider_node_by_id(provider_node_id, db_path=db_path)
+    if not node:
+        raise ValueError(f"Provider node #{provider_node_id} not found.")
+
+    effective_status = compute_node_effective_status(node, heartbeat_timeout_seconds=heartbeat_timeout_seconds)
+    is_online = (effective_status in ("ONLINE", "PAUSED"))
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Fetch expected chunks for this provider node from database
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT fc.id, fc.file_id, fc.chunk_id, fc.provider_node_id, fc.chunk_index, fc.chunk_size,
+                   fc.status AS chunk_status, fc.last_verified_at,
+                   f.filename, f.file_size, f.encrypted_size, f.sha256_hash AS file_sha256, f.status AS file_status
+            FROM file_chunks fc
+            JOIN files f ON f.id = fc.file_id
+            WHERE fc.provider_node_id = ?
+              AND f.status != 'DELETED'
+            ORDER BY fc.id ASC;
+            """,
+            (provider_node_id,),
+        )
+        expected_rows = cursor.fetchall()
+
+    # 2. Parse latest physical inventory reported by provider agent
+    physical_items: Dict[str, Dict[str, Any]] = {}
+    raw_inventory = node.get("last_inventory")
+    if raw_inventory:
+        try:
+            parsed = json.loads(raw_inventory)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and "chunk_id" in item:
+                        physical_items[item["chunk_id"]] = item
+                    elif isinstance(item, str):
+                        physical_items[item] = {"chunk_id": item}
+        except Exception as exc:
+            logger.warning(f"Could not parse last_inventory for node #{provider_node_id}: {exc}")
+
+    expected_map = {row["chunk_id"]: dict(row) for row in expected_rows}
+    verified_chunk_ids_to_update: List[str] = []
+    items: List[Dict[str, Any]] = []
+
+    # Process all expected chunks
+    for cid, exp in expected_map.items():
+        exp_size = exp["chunk_size"]
+        exp_hash = exp.get("file_sha256")
+        last_v_str = str(exp["last_verified_at"]) if exp.get("last_verified_at") else None
+
+        if not is_online:
+            # Node is offline
+            v_dt = None
+            if exp.get("last_verified_at"):
+                try:
+                    ts = exp["last_verified_at"]
+                    if isinstance(ts, str):
+                        v_dt = datetime.fromisoformat(ts.replace(" ", "T"))
+                    elif isinstance(ts, datetime):
+                        v_dt = ts
+                    if v_dt and v_dt.tzinfo is None:
+                        v_dt = v_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    pass
+
+            if v_dt and (now_utc - v_dt).total_seconds() <= verification_freshness_seconds:
+                state = "VERIFIED"
+                detail = "Physical chunk verified present prior to provider heartbeat timeout."
+            else:
+                state = "UNVERIFIED"
+                detail = "Provider node is offline; physical presence and integrity unverified."
+
+            items.append({
+                "chunk_id": cid,
+                "file_id": exp["file_id"],
+                "filename": exp["filename"],
+                "status": state,
+                "expected_size_bytes": exp_size,
+                "actual_size_bytes": None,
+                "expected_checksum": exp_hash,
+                "actual_checksum": None,
+                "last_verified_at": last_v_str,
+                "status_detail": detail,
+            })
+            continue
+
+        # Node is online
+        if cid not in physical_items:
+            items.append({
+                "chunk_id": cid,
+                "file_id": exp["file_id"],
+                "filename": exp["filename"],
+                "status": "MISSING",
+                "expected_size_bytes": exp_size,
+                "actual_size_bytes": None,
+                "expected_checksum": exp_hash,
+                "actual_checksum": None,
+                "last_verified_at": last_v_str,
+                "status_detail": "Expected by coordinator metadata, but chunk file is absent on provider disk.",
+            })
+        else:
+            phys = physical_items[cid]
+            act_size = phys.get("size_bytes")
+            act_hash = phys.get("sha256_hash")
+
+            is_corrupted = False
+            reasons = []
+
+            if act_size is not None and act_size != exp_size:
+                is_corrupted = True
+                reasons.append(f"Size mismatch: expected {exp_size} bytes, found {act_size} bytes on disk")
+
+            if exp_hash and act_hash and (exp_hash.strip().lower() != act_hash.strip().lower()):
+                is_corrupted = True
+                reasons.append(f"Checksum mismatch: expected SHA-256 '{exp_hash[:16]}...', found '{act_hash[:16]}...'")
+
+            if is_corrupted:
+                items.append({
+                    "chunk_id": cid,
+                    "file_id": exp["file_id"],
+                    "filename": exp["filename"],
+                    "status": "CORRUPTED",
+                    "expected_size_bytes": exp_size,
+                    "actual_size_bytes": act_size,
+                    "expected_checksum": exp_hash,
+                    "actual_checksum": act_hash,
+                    "last_verified_at": last_v_str,
+                    "status_detail": "; ".join(reasons),
+                })
+            else:
+                verified_chunk_ids_to_update.append(cid)
+                items.append({
+                    "chunk_id": cid,
+                    "file_id": exp["file_id"],
+                    "filename": exp["filename"],
+                    "status": "VERIFIED",
+                    "expected_size_bytes": exp_size,
+                    "actual_size_bytes": act_size if act_size is not None else exp_size,
+                    "expected_checksum": exp_hash,
+                    "actual_checksum": act_hash or exp_hash,
+                    "last_verified_at": str(now_utc),
+                    "status_detail": "Physically verified present on disk with verified size and SHA-256 integrity.",
+                })
+
+    # Process unexpected chunks (files physically present on disk not belonging to this node)
+    for cid, phys in physical_items.items():
+        if cid not in expected_map:
+            act_size = phys.get("size_bytes")
+            act_hash = phys.get("sha256_hash")
+            items.append({
+                "chunk_id": cid,
+                "file_id": None,
+                "filename": None,
+                "status": "UNEXPECTED",
+                "expected_size_bytes": None,
+                "actual_size_bytes": act_size,
+                "expected_checksum": None,
+                "actual_checksum": act_hash,
+                "last_verified_at": None,
+                "status_detail": "Chunk file physically exists in provider directory, but is not mapped in coordinator metadata.",
+            })
+
+    # Update verified timestamps in database
+    if verified_chunk_ids_to_update:
+        update_chunk_verification(provider_node_id, verified_chunk_ids_to_update, db_path=db_path)
+
+    verified_count = sum(1 for it in items if it["status"] == "VERIFIED")
+    missing_count = sum(1 for it in items if it["status"] == "MISSING")
+    corrupted_count = sum(1 for it in items if it["status"] == "CORRUPTED")
+    unexpected_count = sum(1 for it in items if it["status"] == "UNEXPECTED")
+    unverified_count = sum(1 for it in items if it["status"] == "UNVERIFIED")
+
+    return {
+        "node_id": provider_node_id,
+        "status": effective_status,
+        "total_expected": len(expected_map),
+        "total_physical": len(physical_items),
+        "verified_count": verified_count,
+        "missing_count": missing_count,
+        "corrupted_count": corrupted_count,
+        "unexpected_count": unexpected_count,
+        "unverified_count": unverified_count,
+        "reconciled_at": now_utc.isoformat(),
+        "items": items,
+    }
+
+
+def get_admin_file_storage_records(
+    db_path: Optional[Union[Path, str]] = None,
+    heartbeat_timeout_seconds: int = 60,
+    verification_freshness_seconds: int = 90,
+) -> List[Dict[str, Any]]:
+    """
+    Comprehensive admin storage tracking query.
+    Traces every file from consumer to its physical provider node(s), host computer name,
+    online connectivity, latest chunk jobs (STORE, RETRIEVE, DELETE), and physical disk verification state.
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    def _parse_ts_utc(ts: Any) -> Optional[datetime]:
+        if ts is None:
+            return None
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                return ts.replace(tzinfo=timezone.utc)
+            return ts.astimezone(timezone.utc)
+        if isinstance(ts, str):
+            try:
+                dt = datetime.fromisoformat(ts.replace(" ", "T") if "T" not in ts else ts)
+                if dt.tzinfo is None:
+                    return dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except Exception:
+                return None
+        return None
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+
+        # 1. Fetch all files
+        cursor.execute(
+            """
+            SELECT id, owner_id, filename, file_size, encrypted_size, status, created_at, updated_at
+            FROM files
+            ORDER BY id DESC;
+            """
+        )
+        files = cursor.fetchall()
+
+        # 2. Fetch all users
+        cursor.execute(
+            """
+            SELECT id, email, role, is_active
+            FROM users;
+            """
+        )
+        user_map = {u["id"]: u for u in cursor.fetchall()}
+
+        # 3. Fetch all provider nodes
+        cursor.execute(
+            """
+            SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, status, last_heartbeat, computer_name, created_at, updated_at
+            FROM provider_nodes;
+            """
+        )
+        node_map = {n["id"]: n for n in cursor.fetchall()}
+
+        # 4. Fetch all file chunks
+        cursor.execute(
+            """
+            SELECT id, file_id, chunk_id, provider_node_id, chunk_index, chunk_size, status, last_verified_at, created_at
+            FROM file_chunks
+            ORDER BY file_id DESC, chunk_index ASC;
+            """
+        )
+        all_chunks = cursor.fetchall()
+        chunks_by_file: Dict[int, List[Dict[str, Any]]] = {}
+        for c in all_chunks:
+            chunks_by_file.setdefault(c["file_id"], []).append(c)
+
+        # 5. Fetch all chunk jobs
+        cursor.execute(
+            """
+            SELECT id, provider_node_id, chunk_id, file_id, job_type, status, expires_at, error_message, created_at, updated_at
+            FROM chunk_jobs
+            ORDER BY id ASC;
+            """
+        )
+        all_jobs = cursor.fetchall()
+        jobs_by_chunk: Dict[str, List[Dict[str, Any]]] = {}
+        jobs_by_file: Dict[int, List[Dict[str, Any]]] = {}
+        for j in all_jobs:
+            jobs_by_chunk.setdefault(j["chunk_id"], []).append(j)
+            if j.get("file_id"):
+                jobs_by_file.setdefault(j["file_id"], []).append(j)
+
+    results: List[Dict[str, Any]] = []
+
+    for f in files:
+        consumer = user_map.get(f["owner_id"], {})
+        f_chunks = chunks_by_file.get(f["id"], [])
+
+        processed_chunks: List[Dict[str, Any]] = []
+
+        for c in f_chunks:
+            node = node_map.get(c["provider_node_id"])
+            p_user = user_map.get(node["provider_id"], {}) if node else {}
+
+            # Determine provider node connectivity & status
+            if node:
+                effective_status = compute_node_effective_status(node, heartbeat_timeout_seconds=heartbeat_timeout_seconds)
+                is_online = (effective_status == "ONLINE")
+                comp_name = node.get("computer_name")
+                p_quota = node.get("quota_bytes")
+                p_used = node.get("used_bytes")
+                last_hb_str = str(node["last_heartbeat"]) if node.get("last_heartbeat") else None
+            else:
+                effective_status = "UNKNOWN"
+                is_online = False
+                comp_name = None
+                p_quota = None
+                p_used = None
+                last_hb_str = None
+
+            # Get jobs for this chunk
+            c_jobs = jobs_by_chunk.get(c["chunk_id"], [])
+            store_jobs = [j for j in c_jobs if j["job_type"] == "STORE_CHUNK"]
+            retrieve_jobs = [j for j in c_jobs if j["job_type"] == "RETRIEVE_CHUNK"]
+            delete_jobs = [j for j in c_jobs if j["job_type"] == "DELETE_CHUNK"]
+
+            latest_store = store_jobs[-1] if store_jobs else None
+            latest_retrieve = retrieve_jobs[-1] if retrieve_jobs else None
+            latest_delete = delete_jobs[-1] if delete_jobs else None
+
+            # Determine chunk physical storage verification state
+            if f["status"] == "DELETED" or (latest_delete and latest_delete["status"] == "COMPLETED"):
+                storage_status = "DELETED"
+                status_detail = "Chunk marked as deleted or delete job completed."
+            elif (latest_store and latest_store["status"] in ("FAILED", "TIMED_OUT")) or c["status"] == "FAILED":
+                storage_status = "STORAGE_FAILED"
+                status_detail = f"Chunk storage transfer failed: {latest_store.get('error_message') if latest_store else 'Failed'}"
+            elif c["status"] == "PENDING" or (latest_store and latest_store["status"] in ("QUEUED", "PROCESSING")):
+                storage_status = "DATABASE_ASSIGNED"
+                status_detail = "Database assignment created; transfer in progress."
+            else:
+                # STORE_CHUNK completed or chunk status is STORED
+                if not is_online:
+                    storage_status = "PROVIDER_OFFLINE"
+                    status_detail = "Provider node is offline; physical presence unverified."
+                else:
+                    verified_dt = _parse_ts_utc(c.get("last_verified_at"))
+                    if verified_dt:
+                        age_sec = (now_utc - verified_dt).total_seconds()
+                        if age_sec <= verification_freshness_seconds:
+                            storage_status = "VERIFIED_PHYSICAL"
+                            status_detail = "Physically verified present on provider storage disk."
+                        else:
+                            storage_status = "PHYSICALLY_MISSING"
+                            status_detail = "Provider is online, but chunk is missing from provider agent inventory."
+                    else:
+                        storage_status = "PHYSICALLY_MISSING"
+                        status_detail = "Provider is online, but chunk was not reported in provider agent inventory."
+
+            processed_chunks.append({
+                "chunk_id": c["chunk_id"],
+                "chunk_index": c["chunk_index"],
+                "chunk_size": c["chunk_size"],
+                "chunk_status": c["status"],
+                "last_verified_at": str(c["last_verified_at"]) if c.get("last_verified_at") else None,
+                "provider_node_id": c["provider_node_id"],
+                "provider_email": p_user.get("email"),
+                "computer_name": comp_name,
+                "provider_status": effective_status,
+                "provider_online": is_online,
+                "last_heartbeat": last_hb_str,
+                "quota_bytes": p_quota,
+                "used_bytes": p_used,
+                "storage_status": storage_status,
+                "storage_status_detail": status_detail,
+                "latest_store_job": {
+                    "id": latest_store["id"],
+                    "status": latest_store["status"],
+                    "created_at": str(latest_store["created_at"]),
+                    "updated_at": str(latest_store["updated_at"]) if latest_store.get("updated_at") else None,
+                    "error_message": latest_store.get("error_message"),
+                } if latest_store else None,
+                "latest_retrieve_job": {
+                    "id": latest_retrieve["id"],
+                    "status": latest_retrieve["status"],
+                    "created_at": str(latest_retrieve["created_at"]),
+                    "updated_at": str(latest_retrieve["updated_at"]) if latest_retrieve.get("updated_at") else None,
+                    "error_message": latest_retrieve.get("error_message"),
+                } if latest_retrieve else None,
+                "latest_delete_job": {
+                    "id": latest_delete["id"],
+                    "status": latest_delete["status"],
+                    "created_at": str(latest_delete["created_at"]),
+                    "updated_at": str(latest_delete["updated_at"]) if latest_delete.get("updated_at") else None,
+                    "error_message": latest_delete.get("error_message"),
+                } if latest_delete else None,
+                "all_jobs": [
+                    {
+                        "id": j["id"],
+                        "job_type": j["job_type"],
+                        "status": j["status"],
+                        "created_at": str(j["created_at"]),
+                        "updated_at": str(j["updated_at"]) if j.get("updated_at") else None,
+                        "error_message": j.get("error_message"),
+                    }
+                    for j in c_jobs
+                ],
+            })
+
+        # Determine file-level summary storage status
+        if f["status"] == "DELETED":
+            file_storage_status = "DELETED"
+            file_status_detail = "File has been deleted."
+        elif not processed_chunks:
+            file_storage_status = "DATABASE_ASSIGNED"
+            file_status_detail = "No chunks mapped yet."
+        elif any(ck["storage_status"] == "STORAGE_FAILED" for ck in processed_chunks):
+            file_storage_status = "STORAGE_FAILED"
+            file_status_detail = "One or more chunks failed storage transfer."
+        elif any(ck["storage_status"] == "PHYSICALLY_MISSING" for ck in processed_chunks):
+            file_storage_status = "PHYSICALLY_MISSING"
+            file_status_detail = "One or more chunks missing from provider storage disk."
+        elif any(ck["storage_status"] == "PROVIDER_OFFLINE" for ck in processed_chunks):
+            file_storage_status = "PROVIDER_OFFLINE"
+            file_status_detail = "Provider node is offline; physical presence unverified."
+        elif any(ck["storage_status"] == "DATABASE_ASSIGNED" for ck in processed_chunks):
+            file_storage_status = "DATABASE_ASSIGNED"
+            file_status_detail = "Chunk transfer in progress."
+        elif all(ck["storage_status"] == "VERIFIED_PHYSICAL" for ck in processed_chunks):
+            file_storage_status = "VERIFIED_PHYSICAL"
+            file_status_detail = "All chunks verified present on physical provider disk."
+        else:
+            file_storage_status = "STORED"
+            file_status_detail = "Chunks stored."
+
+        # If chunks were deleted/unlinked but job audit history exists in chunk_jobs:
+        if not processed_chunks and f["id"] in jobs_by_file:
+            f_jobs = jobs_by_file[f["id"]]
+            store_jobs = [j for j in f_jobs if j["job_type"] == "STORE_CHUNK"]
+            retrieve_jobs = [j for j in f_jobs if j["job_type"] == "RETRIEVE_CHUNK"]
+            delete_jobs = [j for j in f_jobs if j["job_type"] == "DELETE_CHUNK"]
+            latest_store = store_jobs[-1] if store_jobs else None
+            latest_retrieve = retrieve_jobs[-1] if retrieve_jobs else None
+            latest_delete = delete_jobs[-1] if delete_jobs else None
+            ref_job = latest_delete or latest_store or f_jobs[-1]
+            ref_node = node_map.get(ref_job["provider_node_id"]) if ref_job else None
+            ref_user = user_map.get(ref_node["provider_id"], {}) if ref_node else {}
+            ref_status = compute_node_effective_status(ref_node, heartbeat_timeout_seconds=heartbeat_timeout_seconds) if ref_node else "UNKNOWN"
+            ref_online = (ref_status == "ONLINE")
+
+            processed_chunks.append({
+                "chunk_id": ref_job["chunk_id"],
+                "chunk_index": 0,
+                "chunk_size": f["encrypted_size"],
+                "chunk_status": "DELETED" if f["status"] == "DELETED" else "UNKNOWN",
+                "last_verified_at": None,
+                "provider_node_id": ref_job["provider_node_id"],
+                "provider_email": ref_user.get("email"),
+                "computer_name": ref_node.get("computer_name") if ref_node else None,
+                "provider_status": ref_status,
+                "provider_online": ref_online,
+                "last_heartbeat": str(ref_node["last_heartbeat"]) if ref_node and ref_node.get("last_heartbeat") else None,
+                "quota_bytes": ref_node.get("quota_bytes") if ref_node else None,
+                "used_bytes": ref_node.get("used_bytes") if ref_node else None,
+                "storage_status": file_storage_status,
+                "storage_status_detail": file_status_detail,
+                "latest_store_job": {
+                    "id": latest_store["id"],
+                    "status": latest_store["status"],
+                    "created_at": str(latest_store["created_at"]),
+                    "updated_at": str(latest_store["updated_at"]) if latest_store.get("updated_at") else None,
+                    "error_message": latest_store.get("error_message"),
+                } if latest_store else None,
+                "latest_retrieve_job": {
+                    "id": latest_retrieve["id"],
+                    "status": latest_retrieve["status"],
+                    "created_at": str(latest_retrieve["created_at"]),
+                    "updated_at": str(latest_retrieve["updated_at"]) if latest_retrieve.get("updated_at") else None,
+                    "error_message": latest_retrieve.get("error_message"),
+                } if latest_retrieve else None,
+                "latest_delete_job": {
+                    "id": latest_delete["id"],
+                    "status": latest_delete["status"],
+                    "created_at": str(latest_delete["created_at"]),
+                    "updated_at": str(latest_delete["updated_at"]) if latest_delete.get("updated_at") else None,
+                    "error_message": latest_delete.get("error_message"),
+                } if latest_delete else None,
+                "all_jobs": [
+                    {
+                        "id": j["id"],
+                        "job_type": j["job_type"],
+                        "status": j["status"],
+                        "created_at": str(j["created_at"]),
+                        "updated_at": str(j["updated_at"]) if j.get("updated_at") else None,
+                        "error_message": j.get("error_message"),
+                    }
+                    for j in f_jobs
+                ],
+            })
+
+        primary = processed_chunks[0] if processed_chunks else None
+
+        results.append({
+            "file_id": f["id"],
+            "filename": f["filename"],
+            "consumer_id": f["owner_id"],
+            "consumer_email": consumer.get("email"),
+            "file_size": f["file_size"],
+            "encrypted_size": f["encrypted_size"],
+            "lifecycle_status": f["status"],
+            "storage_status": file_storage_status,
+            "storage_status_detail": file_status_detail,
+            "created_at": str(f["created_at"]) if f.get("created_at") else None,
+            "updated_at": str(f["updated_at"]) if f.get("updated_at") else None,
+            # Top-level primary chunk telemetry (convenience for flat representations)
+            "chunk_id": primary["chunk_id"] if primary else None,
+            "chunk_index": primary["chunk_index"] if primary else None,
+            "provider_node_id": primary["provider_node_id"] if primary else None,
+            "provider_email": primary["provider_email"] if primary else None,
+            "computer_name": primary["computer_name"] if primary else None,
+            "provider_status": primary["provider_status"] if primary else None,
+            "provider_online": primary["provider_online"] if primary else False,
+            "last_heartbeat": primary["last_heartbeat"] if primary else None,
+            "quota_bytes": primary["quota_bytes"] if primary else None,
+            "used_bytes": primary["used_bytes"] if primary else None,
+            "last_verified_at": primary["last_verified_at"] if primary else None,
+            "latest_store_job": primary["latest_store_job"] if primary else None,
+            "latest_retrieve_job": primary["latest_retrieve_job"] if primary else None,
+            "latest_delete_job": primary["latest_delete_job"] if primary else None,
+            # Complete list of all chunk placement mappings & job history
+            "chunks": processed_chunks,
+        })
+
+    return results

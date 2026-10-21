@@ -224,6 +224,52 @@ export const authApi = {
   },
 
   /**
+   * Provider Physical Chunk Reconciliation API
+   */
+  async getProviderReconciliation() {
+    const token = getToken()
+    if (!token) {
+      throw new Error('Authentication token required.')
+    }
+
+    const response = await fetch('/api/provider/reconciliation', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+      },
+    })
+
+    if (!response.ok) {
+      throw await parseApiError(response)
+    }
+
+    return await response.json()
+  },
+
+  /**
+   * Provider Asynchronous Job History & Health Telemetry API
+   */
+  async getProviderJobHistory(limit = 20) {
+    const token = getToken()
+    if (!token) {
+      throw new Error('Authentication token required.')
+    }
+
+    const response = await fetch(`/api/provider/jobs/history?limit=${limit}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+      },
+    })
+
+    if (!response.ok) {
+      throw await parseApiError(response)
+    }
+
+    return await response.json()
+  },
+
+  /**
    * Preserved System Diagnostics
    */
   async getHealth() {
@@ -239,6 +285,29 @@ export const authApi = {
     if (!response.ok) {
       throw await parseApiError(response)
     }
+    return await response.json()
+  },
+
+  /**
+   * Admin-Only: Physical Storage Tracking
+   */
+  async getFileStorageTracking() {
+    const token = getToken()
+    if (!token) {
+      throw new Error('Admin token required.')
+    }
+
+    const response = await fetch('/api/admin/files/storage', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+      },
+    })
+
+    if (!response.ok) {
+      throw await parseApiError(response)
+    }
+
     return await response.json()
   },
 }

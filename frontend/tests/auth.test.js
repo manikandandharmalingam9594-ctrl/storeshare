@@ -189,3 +189,38 @@ test('Storage provider node setup schema validation', async (t) => {
   })
   assert.equal(res.status, 401)
 })
+
+test('Admin File Storage Tracking endpoint authorization and structure', async (t) => {
+  // 1. Unauthenticated request to /api/admin/files/storage returns 401
+  const unauthRes = await fetch(`${BASE_URL}/api/admin/files/storage`)
+  assert.equal(unauthRes.status, 401)
+
+  // 2. Log in as admin to obtain admin JWT
+  const loginRes = await fetch(`${BASE_URL}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'admin@storeshare.io', password: 'AdminMasterKey123!' }),
+  })
+  assert.equal(loginRes.status, 200)
+  const loginData = await loginRes.json()
+  const adminToken = loginData.access_token
+  assert.ok(adminToken)
+
+  // 3. Admin request to /api/admin/files/storage returns 200 with tracking records
+  const trackRes = await fetch(`${BASE_URL}/api/admin/files/storage`, {
+    headers: { Authorization: `Bearer ${adminToken}` },
+  })
+  assert.equal(trackRes.status, 200)
+  const records = await trackRes.json()
+  assert.ok(Array.isArray(records))
+
+  if (records.length > 0) {
+    const file = records[0]
+    assert.ok(typeof file.file_id === 'number')
+    assert.ok(typeof file.filename === 'string')
+    assert.ok(typeof file.consumer_id === 'number')
+    assert.ok(typeof file.storage_status === 'string')
+    assert.ok(Array.isArray(file.chunks))
+  }
+})
+

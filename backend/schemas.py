@@ -1,7 +1,7 @@
 from enum import Enum
 from pathlib import Path
 import re
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -118,6 +118,7 @@ class ProviderSetupRequest(BaseModel):
     storage_dir: str = Field(..., description="Local storage directory path on provider host")
     quota_gb: float = Field(..., description="Allocated storage quota in Gigabytes")
     action: str = Field(default="START", description="Action to perform: START, STOP, or UPDATE")
+    computer_name: Optional[str] = Field(default=None, description="Physical hostname or computer name of provider host")
 
     @field_validator("storage_dir")
     @classmethod
@@ -140,8 +141,8 @@ class ProviderSetupRequest(BaseModel):
     @classmethod
     def validate_action(cls, v: str) -> str:
         upper = v.strip().upper()
-        if upper not in ("START", "STOP", "UPDATE"):
-            raise ValueError("Action must be one of: START, STOP, UPDATE.")
+        if upper not in ("START", "STOP", "UPDATE", "PAUSE"):
+            raise ValueError("Action must be one of: START, STOP, UPDATE, PAUSE.")
         return upper
 
 
@@ -155,6 +156,9 @@ class ProviderHeartbeatRequest(BaseModel):
     used_bytes: int = Field(..., ge=0, description="Actual bytes used by stored chunks")
     free_disk_bytes: int = Field(..., ge=0, description="Free filesystem disk bytes reported by agent")
     agent_version: str = Field(default="0.1.0", description="Provider agent version string")
+    computer_name: Optional[str] = Field(default=None, description="Physical hostname or computer name of provider host")
+    chunk_ids: Optional[List[str]] = Field(default=None, description="List of chunk IDs physically stored on provider disk")
+    inventory: Optional[List[Dict[str, Any]]] = Field(default=None, description="Detailed physical chunk inventory with sha256 and byte sizes")
 
 
 class ProviderNodeStatusResponse(BaseModel):
@@ -164,10 +168,13 @@ class ProviderNodeStatusResponse(BaseModel):
     configured: bool
     status: str
     storage_dir: Optional[str] = None
+    computer_name: Optional[str] = None
     quota_bytes: int
     quota_gb: float
     used_bytes: int
     available_bytes: int
+    free_disk_bytes: int = 0
+    warnings: List[str] = Field(default_factory=list)
     last_heartbeat: Optional[str] = None
     is_online: bool
 
@@ -178,7 +185,65 @@ class ProviderHeartbeatResponse(BaseModel):
     """
     status: str
     action: str = "CONTINUE"
+    quota_bytes: Optional[int] = None
     server_time: str
+
+
+class ChunkInventoryItem(BaseModel):
+    chunk_id: str
+    size_bytes: int
+    sha256_hash: Optional[str] = None
+    modified_at: Optional[int] = None
+
+
+class ProviderInventoryReportRequest(BaseModel):
+    items: List[ChunkInventoryItem]
+
+
+class ReconciliationItem(BaseModel):
+    chunk_id: str
+    file_id: Optional[int] = None
+    filename: Optional[str] = None
+    status: str
+    expected_size_bytes: Optional[int] = None
+    actual_size_bytes: Optional[int] = None
+    expected_checksum: Optional[str] = None
+    actual_checksum: Optional[str] = None
+    last_verified_at: Optional[str] = None
+    status_detail: str
+
+
+class ReconciliationReportResponse(BaseModel):
+    node_id: int
+    status: str
+    total_expected: int
+    total_physical: int
+    verified_count: int
+    missing_count: int
+    corrupted_count: int
+    unexpected_count: int
+    unverified_count: int
+    reconciled_at: str
+    items: List[ReconciliationItem]
+
+
+class ProviderJobHistoryItem(BaseModel):
+    id: int
+    provider_node_id: int
+    chunk_id: str
+    file_id: int
+    job_type: str
+    status: str
+    error_message: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class ProviderJobTelemetryResponse(BaseModel):
+    active_jobs: int
+    completed_jobs: int
+    failed_jobs: int
+    recent_jobs: List[ProviderJobHistoryItem]
 
 
 class FileRecordResponse(BaseModel):
@@ -282,4 +347,73 @@ class FileDeleteResponse(BaseModel):
     file_id: int
     status: str
     message: str
+
+
+class AdminChunkJobSummary(BaseModel):
+    id: int
+    status: str
+    created_at: str
+    updated_at: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class AdminChunkJobDetail(BaseModel):
+    id: int
+    job_type: str
+    status: str
+    created_at: str
+    updated_at: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class AdminChunkTrackingResponse(BaseModel):
+    chunk_id: str
+    chunk_index: int
+    chunk_size: int
+    chunk_status: str
+    last_verified_at: Optional[str] = None
+    provider_node_id: Optional[int] = None
+    provider_email: Optional[str] = None
+    computer_name: Optional[str] = None
+    provider_status: Optional[str] = None
+    provider_online: bool
+    last_heartbeat: Optional[str] = None
+    quota_bytes: Optional[int] = None
+    used_bytes: Optional[int] = None
+    storage_status: str
+    storage_status_detail: str
+    latest_store_job: Optional[AdminChunkJobSummary] = None
+    latest_retrieve_job: Optional[AdminChunkJobSummary] = None
+    latest_delete_job: Optional[AdminChunkJobSummary] = None
+    all_jobs: List[AdminChunkJobDetail] = Field(default_factory=list)
+
+
+class AdminFileStorageTrackingResponse(BaseModel):
+    file_id: int
+    filename: str
+    consumer_id: int
+    consumer_email: Optional[str] = None
+    file_size: int
+    encrypted_size: int
+    lifecycle_status: str
+    storage_status: str
+    storage_status_detail: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    chunk_id: Optional[str] = None
+    chunk_index: Optional[int] = None
+    provider_node_id: Optional[int] = None
+    provider_email: Optional[str] = None
+    computer_name: Optional[str] = None
+    provider_status: Optional[str] = None
+    provider_online: bool = False
+    last_heartbeat: Optional[str] = None
+    quota_bytes: Optional[int] = None
+    used_bytes: Optional[int] = None
+    last_verified_at: Optional[str] = None
+    latest_store_job: Optional[AdminChunkJobSummary] = None
+    latest_retrieve_job: Optional[AdminChunkJobSummary] = None
+    latest_delete_job: Optional[AdminChunkJobSummary] = None
+    chunks: List[AdminChunkTrackingResponse] = Field(default_factory=list)
+
 

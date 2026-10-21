@@ -38,6 +38,8 @@ data/*.db
 data/*.db-journal
 data/*.sqlite3
 data/*.backup
+data/provider_storage/
+data/spool/
 !data/.gitkeep
 
 # Node / Frontend

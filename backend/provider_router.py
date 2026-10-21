@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import hashlib
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -12,20 +13,27 @@ from backend.database import (
     fail_chunk_job,
     get_chunk_job_by_id,
     get_file_by_id,
+    get_provider_job_telemetry,
     get_provider_node,
+    get_provider_reconciliation_records,
     poll_provider_jobs,
     record_provider_heartbeat,
     set_provider_node_status,
+    update_chunk_verification,
     upsert_provider_node,
 )
 from backend.dependencies import require_provider
 from backend.schemas import (
+    ChunkInventoryItem,
     ChunkJobResponse,
     JobFailRequest,
     ProviderHeartbeatRequest,
     ProviderHeartbeatResponse,
+    ProviderInventoryReportRequest,
+    ProviderJobTelemetryResponse,
     ProviderNodeStatusResponse,
     ProviderSetupRequest,
+    ReconciliationReportResponse,
 )
 from backend.spool import get_spool_chunk, remove_spool_chunk, save_spool_chunk
 
@@ -41,20 +49,16 @@ def _compute_effective_status(node: Dict[str, Any]) -> str:
     If coordinator hasn't received a heartbeat within timeout, mark as OFFLINE.
     """
     raw_status = node.get("status", "UNREGISTERED")
-    if raw_status == "STOPPED":
-        return "STOPPED"
-    if raw_status == "UNREGISTERED":
-        return "UNREGISTERED"
+    if raw_status in ("STOPPED", "PAUSED", "UNREGISTERED"):
+        return raw_status
 
     last_hb = node.get("last_heartbeat")
     if not last_hb:
         return "OFFLINE"
 
     try:
-        # SQLite stores timestamps as 'YYYY-MM-DD HH:MM:SS'
         if isinstance(last_hb, str):
-            # Parse SQLite timestamp
-            hb_time = datetime.fromisoformat(last_hb)
+            hb_time = datetime.fromisoformat(last_hb.replace(" ", "T"))
         else:
             hb_time = last_hb
 
@@ -68,6 +72,36 @@ def _compute_effective_status(node: Dict[str, Any]) -> str:
     except Exception as exc:
         logger.warning(f"Error parsing last_heartbeat timestamp '{last_hb}': {exc}")
         return "OFFLINE"
+
+
+def _generate_node_warnings(node: Dict[str, Any], effective_status: str) -> List[str]:
+    """
+    Generate actionable warnings for provider operators regarding disk space, quota, and state.
+    """
+    warnings: List[str] = []
+    quota_bytes = node.get("quota_bytes", 0)
+    used_bytes = node.get("used_bytes", 0)
+    free_disk = node.get("free_disk_bytes", 0)
+
+    if effective_status == "OFFLINE":
+        warnings.append("Provider storage agent is OFFLINE. Start the agent on your machine to accept jobs.")
+    elif effective_status == "STOPPED":
+        warnings.append("Storage node is STOPPED by operator.")
+    elif effective_status == "PAUSED":
+        warnings.append("Storage node is PAUSED. Storage jobs will not be accepted.")
+
+    if quota_bytes > 0:
+        used_pct = (used_bytes / quota_bytes) * 100
+        if used_pct >= 100:
+            warnings.append("Storage quota exhausted (100% used). Increase quota to accept new chunks.")
+        elif used_pct >= 90:
+            warnings.append(f"Storage quota near capacity ({round(used_pct, 1)}% used).")
+
+    if free_disk > 0 and free_disk < 1024 * 1024 * 1024:  # < 1 GB
+        free_mb = round(free_disk / (1024**2), 1)
+        warnings.append(f"Low physical disk space: host filesystem has only {free_mb} MB free remaining.")
+
+    return warnings
 
 
 @router.get("/node", response_model=ProviderNodeStatusResponse, summary="Get Provider Node Status")
@@ -90,6 +124,8 @@ def get_node_status(
             quota_gb=0.0,
             used_bytes=0,
             available_bytes=0,
+            free_disk_bytes=0,
+            warnings=["Storage directory not yet configured."],
             last_heartbeat=None,
             is_online=False,
         )
@@ -97,19 +133,24 @@ def get_node_status(
     effective_status = _compute_effective_status(node)
     quota_bytes = node.get("quota_bytes", 0)
     used_bytes = node.get("used_bytes", 0)
+    free_disk_bytes = node.get("free_disk_bytes", 0)
     available = max(0, quota_bytes - used_bytes)
     quota_gb = round(quota_bytes / (1024**3), 2)
+    warnings = _generate_node_warnings(node, effective_status)
 
     return ProviderNodeStatusResponse(
         configured=bool(node.get("storage_dir") and quota_bytes > 0),
         status=effective_status,
         storage_dir=node.get("storage_dir"),
+        computer_name=node.get("computer_name"),
         quota_bytes=quota_bytes,
         quota_gb=quota_gb,
         used_bytes=used_bytes,
         available_bytes=available,
+        free_disk_bytes=free_disk_bytes,
+        warnings=warnings,
         last_heartbeat=str(node["last_heartbeat"]) if node.get("last_heartbeat") else None,
-        is_online=(effective_status == "ONLINE"),
+        is_online=(effective_status in ("ONLINE", "PAUSED")),
     )
 
 
@@ -120,7 +161,7 @@ def setup_node_storage(
 ) -> ProviderNodeStatusResponse:
     """
     Set or update local storage allocation and desired node run-state.
-    Validates quota and updates database record for authenticated provider.
+    Validates quota and updates database record for authenticated provider safely without deleting existing data.
     """
     provider_id = provider_user["id"]
     quota_bytes = int(payload.quota_gb * (1024**3))
@@ -129,37 +170,49 @@ def setup_node_storage(
     if payload.action == "STOP":
         target_status = "STOPPED"
         logger.info(f"Provider {provider_id} marked storage node as STOPPED.")
-    else:
-        # If starting or updating, keep existing status or default to UNREGISTERED/OFFLINE
-        if existing and existing.get("status") in ("ONLINE", "OFFLINE"):
+    elif payload.action == "PAUSE":
+        target_status = "PAUSED"
+        logger.info(f"Provider {provider_id} marked storage node as PAUSED.")
+    elif payload.action == "START":
+        # If resuming from PAUSED or STOPPED, transition back to ONLINE if recent heartbeat, else UNREGISTERED
+        if existing and existing.get("status") in ("PAUSED", "STOPPED"):
+            target_status = "ONLINE" if _compute_effective_status(existing) == "ONLINE" else "UNREGISTERED"
+        elif existing and existing.get("status") in ("ONLINE", "OFFLINE"):
             target_status = existing["status"]
         else:
             target_status = "UNREGISTERED"
-        logger.info(
-            f"Provider {provider_id} configured storage: dir='{payload.storage_dir}', "
-            f"quota={payload.quota_gb} GB ({quota_bytes} bytes), action={payload.action}."
-        )
+        logger.info(f"Provider {provider_id} started/resumed storage node.")
+    else:  # UPDATE
+        if existing and existing.get("status") in ("ONLINE", "OFFLINE", "PAUSED", "STOPPED"):
+            target_status = existing["status"]
+        else:
+            target_status = "UNREGISTERED"
 
     node = upsert_provider_node(
         provider_id=provider_id,
         quota_bytes=quota_bytes,
         storage_dir=payload.storage_dir,
         status=target_status,
+        computer_name=payload.computer_name,
     )
 
     effective_status = _compute_effective_status(node)
     available = max(0, node["quota_bytes"] - node["used_bytes"])
+    warnings = _generate_node_warnings(node, effective_status)
 
     return ProviderNodeStatusResponse(
         configured=True,
         status=effective_status,
         storage_dir=node["storage_dir"],
+        computer_name=node.get("computer_name"),
         quota_bytes=node["quota_bytes"],
         quota_gb=round(node["quota_bytes"] / (1024**3), 2),
         used_bytes=node["used_bytes"],
         available_bytes=available,
+        free_disk_bytes=node.get("free_disk_bytes", 0),
+        warnings=warnings,
         last_heartbeat=str(node["last_heartbeat"]) if node.get("last_heartbeat") else None,
-        is_online=(effective_status == "ONLINE"),
+        is_online=(effective_status in ("ONLINE", "PAUSED")),
     )
 
 
@@ -170,31 +223,123 @@ def agent_heartbeat(
 ) -> ProviderHeartbeatResponse:
     """
     Authenticated outbound heartbeat sent by the local Python provider agent.
-    Updates last_heartbeat timestamp and transitions node to ONLINE.
+    Updates last_heartbeat timestamp and capacity telemetry.
+    Verifies physical presence and integrity of reported chunk inventory.
     """
     provider_id = provider_user["id"]
     existing = get_provider_node(provider_id)
 
-    # If the provider explicitly clicked 'Stop Storage Node', notify the agent to pause/stop
+    # Check operator-initiated state overrides
     if existing and existing.get("status") == "STOPPED":
         return ProviderHeartbeatResponse(
             status="STOPPED",
             action="STOP",
+            quota_bytes=existing.get("quota_bytes"),
             server_time=datetime.now(timezone.utc).isoformat(),
         )
 
-    # Record active heartbeat and update capacity metrics
-    record_provider_heartbeat(
+    if existing and existing.get("status") == "PAUSED":
+        action = "PAUSE"
+    else:
+        action = "CONTINUE"
+
+    inventory_json = None
+    if payload.inventory:
+        try:
+            inventory_json = json.dumps(payload.inventory)
+        except Exception as exc:
+            logger.warning(f"Failed to serialize detailed inventory for provider {provider_id}: {exc}")
+
+    # Record active heartbeat, computer hostname, and capacity metrics
+    node = record_provider_heartbeat(
         provider_id=provider_id,
         used_bytes=payload.used_bytes,
         allocated_bytes=payload.allocated_bytes,
+        computer_name=payload.computer_name,
+        free_disk_bytes=payload.free_disk_bytes,
+        inventory_json=inventory_json,
     )
 
+    # If the agent reported chunk IDs, update verification timestamps
+    if node and payload.chunk_ids:
+        update_chunk_verification(node["id"], payload.chunk_ids)
+
+    effective_status = _compute_effective_status(node) if node else "ONLINE"
+
     return ProviderHeartbeatResponse(
-        status="ONLINE",
-        action="CONTINUE",
+        status=effective_status,
+        action=action,
+        quota_bytes=node.get("quota_bytes") if node else None,
         server_time=datetime.now(timezone.utc).isoformat(),
     )
+
+
+@router.get("/reconciliation", response_model=ReconciliationReportResponse, summary="Provider Physical Chunk Reconciliation")
+def get_reconciliation_report(
+    provider_user: Dict[str, Any] = Depends(require_provider),
+) -> ReconciliationReportResponse:
+    """
+    Performs physical chunk reconciliation for the authenticated provider's storage node.
+    Compares expected chunks with physical chunks on disk across 5 states:
+    VERIFIED, MISSING, CORRUPTED, UNEXPECTED, UNVERIFIED.
+    """
+    provider_id = provider_user["id"]
+    node = get_provider_node(provider_id)
+    if not node:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Provider node not configured.")
+
+    report = get_provider_reconciliation_records(provider_node_id=node["id"])
+    return ReconciliationReportResponse(**report)
+
+
+@router.post("/inventory", summary="Submit Detailed Physical Chunk Inventory")
+def submit_inventory(
+    payload: ProviderInventoryReportRequest,
+    provider_user: Dict[str, Any] = Depends(require_provider),
+) -> Dict[str, Any]:
+    """
+    Explicit physical inventory submission with chunk IDs, byte sizes, and SHA-256 hashes.
+    """
+    provider_id = provider_user["id"]
+    node = get_provider_node(provider_id)
+    if not node:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Provider node not configured.")
+
+    items_list = [item.model_dump() for item in payload.items]
+    inv_json = json.dumps(items_list)
+
+    upsert_provider_node(
+        provider_id=provider_id,
+        quota_bytes=node["quota_bytes"],
+        storage_dir=node["storage_dir"],
+        status=node["status"],
+        computer_name=node.get("computer_name"),
+        free_disk_bytes=node.get("free_disk_bytes", 0),
+        last_inventory=inv_json,
+    )
+
+    chunk_ids = [item.chunk_id for item in payload.items]
+    if chunk_ids:
+        update_chunk_verification(node["id"], chunk_ids)
+
+    return {"status": "SUCCESS", "chunk_count": len(chunk_ids)}
+
+
+@router.get("/jobs/history", response_model=ProviderJobTelemetryResponse, summary="Get Provider Job Telemetry and History")
+def get_jobs_history(
+    limit: int = 20,
+    provider_user: Dict[str, Any] = Depends(require_provider),
+) -> ProviderJobTelemetryResponse:
+    """
+    Retrieve active, completed, and failed job counts and recent audit history.
+    """
+    provider_id = provider_user["id"]
+    node = get_provider_node(provider_id)
+    if not node:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Provider node not configured.")
+
+    telemetry = get_provider_job_telemetry(provider_node_id=node["id"], limit=limit)
+    return ProviderJobTelemetryResponse(**telemetry)
 
 
 # ==============================================================================

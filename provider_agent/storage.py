@@ -10,13 +10,14 @@ Responsibilities:
 6. Stores NO plaintext consumer files or encryption keys (operates solely on opaque binary chunks).
 """
 
+import hashlib
 import logging
 import os
 from pathlib import Path
 import re
 import shutil
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import uuid
 
 logger = logging.getLogger("store-share-agent.storage")
@@ -264,7 +265,7 @@ class StorageManager:
 
         target_path = self.get_safe_chunk_path(chunk_id)
 
-        # Acquire lock to verify quota and adjust reservation
+        # Acquire lock to verify quota and atomically reserve in-flight space
         with self._lock:
             # If target already exists, calculate difference
             existing_size = target_path.stat().st_size if target_path.exists() else 0
@@ -275,9 +276,20 @@ class StorageManager:
                     raise QuotaExceededError(
                         f"Writing chunk {chunk_id} ({chunk_size} bytes) exceeds quota."
                     )
-            else:
-                # Deduct chunk_size from reserved_bytes
-                self._reserved_bytes = max(0, self._reserved_bytes - chunk_size)
+                # Check physical disk space
+                try:
+                    free_disk = shutil.disk_usage(self.storage_dir).free
+                    if self._reserved_bytes + size_delta > free_disk:
+                        raise QuotaExceededError(
+                            f"Physical disk full: requested {size_delta} bytes, but disk only has {free_disk} free bytes."
+                        )
+                except (QuotaExceededError, ValueError):
+                    raise
+                except Exception as exc:
+                    logger.warning(f"Could not verify physical disk space: {exc}")
+
+                if size_delta > 0:
+                    self._reserved_bytes += size_delta
 
         # Write to temporary file with unique UUID
         temp_filename = f".tmp_{uuid.uuid4().hex}"
@@ -292,8 +304,12 @@ class StorageManager:
             # Atomic rename / replace
             os.replace(temp_path, target_path)
 
-            # Update committed usage
+            # Update committed usage and release in-flight reservation
             with self._lock:
+                if not pre_reserved and size_delta > 0:
+                    self._reserved_bytes = max(0, self._reserved_bytes - size_delta)
+                elif pre_reserved:
+                    self._reserved_bytes = max(0, self._reserved_bytes - chunk_size)
                 self._used_bytes = max(0, self._used_bytes + size_delta)
 
             return chunk_size
@@ -305,8 +321,10 @@ class StorageManager:
                     temp_path.unlink()
                 except Exception:
                     pass
-            # If write failed and space was pre-reserved, make sure reservation is released
-            if pre_reserved:
+            # Release in-flight reservation
+            if not pre_reserved and size_delta > 0:
+                self.release_reservation(size_delta)
+            elif pre_reserved:
                 self.release_reservation(chunk_size)
             raise StorageError(f"Failed to write chunk {chunk_id} atomically: {exc}") from exc
 
@@ -369,3 +387,139 @@ class StorageManager:
                 "total_disk_bytes": total_disk_bytes,
                 "chunk_count": len(chunk_files),
             }
+
+    def set_quota(self, new_quota_bytes: int) -> int:
+        """
+        Safely update the configured storage quota without deleting existing data.
+        If new quota is smaller than current usage, blocks future writes until space is freed.
+        """
+        if new_quota_bytes <= 0:
+            raise ValueError(f"Quota bytes must be greater than 0, received: {new_quota_bytes}")
+
+        with self._lock:
+            self.quota_bytes = int(new_quota_bytes)
+            if self._used_bytes > self.quota_bytes:
+                logger.warning(
+                    f"New quota ({self.quota_bytes} bytes) is less than existing used space ({self._used_bytes} bytes). "
+                    "Existing data is preserved, but new writes will be blocked until usage falls below quota."
+                )
+            else:
+                logger.info(f"Storage quota updated safely to {self.quota_bytes} bytes.")
+            return self.quota_bytes
+
+    def get_chunk_inventory(self) -> list[str]:
+        """
+        Return the list of chunk IDs physically stored on disk in the chunks directory.
+        Only returns valid chunk IDs without exposing filesystem paths.
+        """
+        with self._lock:
+            try:
+                if not self.chunks_dir.exists():
+                    return []
+                return [
+                    f.name
+                    for f in self.chunks_dir.iterdir()
+                    if f.is_file() and not f.name.startswith(".tmp_") and CHUNK_ID_PATTERN.match(f.name)
+                ]
+            except Exception as exc:
+                logger.warning(f"Failed to scan chunk inventory: {exc}")
+                return []
+
+    def get_detailed_inventory(self) -> List[Dict[str, Any]]:
+        """
+        Return the list of chunk metadata physically stored on disk, including
+        chunk ID, actual byte size, SHA-256 hash, and modification timestamp.
+        Does not expose filesystem paths.
+        """
+        with self._lock:
+            inventory: List[Dict[str, Any]] = []
+            try:
+                if not self.chunks_dir.exists():
+                    return []
+                for entry in self.chunks_dir.iterdir():
+                    try:
+                        if entry.name.startswith(".tmp_") or entry.is_symlink() or not entry.is_file():
+                            continue
+                        if not CHUNK_ID_PATTERN.match(entry.name):
+                            continue
+
+                        st = entry.stat()
+                        size = st.st_size
+
+                        # Compute SHA-256 hash of opaque chunk ciphertext
+                        sha = hashlib.sha256()
+                        with open(entry, "rb") as f:
+                            while chunk := f.read(65536):
+                                sha.update(chunk)
+
+                        inventory.append({
+                            "chunk_id": entry.name,
+                            "size_bytes": size,
+                            "sha256_hash": sha.hexdigest(),
+                            "modified_at": int(st.st_mtime),
+                        })
+                    except Exception as exc:
+                        logger.warning(f"Error inspecting chunk {entry.name}: {exc}")
+                        continue
+            except Exception as exc:
+                logger.warning(f"Failed to scan detailed chunk inventory: {exc}")
+            return inventory
+
+    def verify_single_chunk(
+        self,
+        chunk_id: str,
+        expected_size: Optional[int] = None,
+        expected_hash: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Inspect physical existence, byte size, and SHA-256 hash of a single chunk.
+        """
+        try:
+            target_path = self.get_safe_chunk_path(chunk_id)
+        except SecurityViolationError as sve:
+            return {
+                "chunk_id": chunk_id,
+                "exists": False,
+                "error": str(sve),
+                "is_valid": False,
+            }
+
+        if not target_path.is_file():
+            return {
+                "chunk_id": chunk_id,
+                "exists": False,
+                "actual_size": 0,
+                "sha256_hash": None,
+                "is_valid": False,
+            }
+
+        try:
+            st = target_path.stat()
+            actual_size = st.st_size
+            sha = hashlib.sha256()
+            with open(target_path, "rb") as f:
+                while chunk := f.read(65536):
+                    sha.update(chunk)
+            act_hash = sha.hexdigest()
+
+            matches_size = (expected_size is None or actual_size == expected_size)
+            matches_hash = (expected_hash is None or act_hash.lower() == expected_hash.lower())
+            is_valid = matches_size and matches_hash
+
+            return {
+                "chunk_id": chunk_id,
+                "exists": True,
+                "actual_size": actual_size,
+                "sha256_hash": act_hash,
+                "matches_size": matches_size,
+                "matches_hash": matches_hash,
+                "is_valid": is_valid,
+            }
+        except Exception as exc:
+            return {
+                "chunk_id": chunk_id,
+                "exists": True,
+                "error": str(exc),
+                "is_valid": False,
+            }
+

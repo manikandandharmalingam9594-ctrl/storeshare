@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 # Load environment variables (.env) from project root if present
 load_dotenv()
 
+from backend.admin_router import router as admin_router
 from backend.auth_router import router as auth_router
 from backend.consumer_router import router as consumer_router
 from backend.provider_router import router as provider_router
@@ -74,6 +75,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(provider_router)
 app.include_router(consumer_router)
+app.include_router(admin_router)
 
 
 class HealthResponse(BaseModel):

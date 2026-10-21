@@ -14,6 +14,7 @@ Features:
 from datetime import datetime, timezone
 import logging
 import signal
+import socket
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -170,6 +171,7 @@ class ProviderAgent:
             "storage_dir": stats["storage_dir"],
             "quota_gb": stats["quota_gb"],
             "action": action,
+            "computer_name": socket.gethostname(),
         }
 
         logger.info(f"Registering storage node setup with coordinator (action={action})...")
@@ -199,17 +201,22 @@ class ProviderAgent:
     def send_heartbeat(self) -> Dict[str, Any]:
         """
         Send outbound telemetry heartbeat to coordinator.
-        Reports allocated bytes, used bytes, and physical free disk bytes.
+        Reports allocated bytes, used bytes, physical free disk bytes, computer hostname, and chunk inventory.
         """
         if not self.token:
             self.authenticate()
 
         stats = self.storage.get_stats()
+        chunk_ids = self.storage.get_chunk_inventory()
+        detailed_inventory = self.storage.get_detailed_inventory()
         payload = {
             "allocated_bytes": stats["quota_bytes"],
             "used_bytes": stats["used_bytes"],
             "free_disk_bytes": stats["free_disk_bytes"],
             "agent_version": "0.1.0",
+            "computer_name": socket.gethostname(),
+            "chunk_ids": chunk_ids,
+            "inventory": detailed_inventory,
         }
 
         res = self.client.post(
@@ -232,6 +239,20 @@ class ProviderAgent:
             raise RuntimeError(f"Heartbeat failed (HTTP {res.status_code}): {res.text}")
 
         data = res.json()
+
+        # Dynamic coordinator quota synchronization without deleting data
+        server_quota = data.get("quota_bytes")
+        if server_quota and server_quota > 0 and server_quota != self.storage.quota_bytes:
+            logger.info(f"Coordinator updated quota to {server_quota} bytes. Syncing local storage manager...")
+            self.storage.set_quota(server_quota)
+
+        server_action = data.get("action")
+        node_status = data.get("status")
+        if server_action in ("STOP", "PAUSE") or node_status in ("STOPPED", "PAUSED"):
+            self._is_paused = True
+        elif server_action == "CONTINUE" and node_status == "ONLINE" and self._is_paused:
+            self._is_paused = False
+
         return data
 
     def heartbeat_once(self) -> Dict[str, Any]:
@@ -403,6 +424,12 @@ class ProviderAgent:
 
         logger.info(f"Processing job #{job_id} ({job_type}) for chunk '{chunk_id}'...")
 
+        if self._is_paused and job_type == "STORE_CHUNK":
+            msg = "Storage node is PAUSED; rejecting new STORE_CHUNK job."
+            logger.warning(f"Job #{job_id}: {msg}")
+            self.fail_job(job_id, msg)
+            return False
+
         try:
             if job_type == "STORE_CHUNK":
                 # 1. Fetch ciphertext from coordinator
@@ -510,9 +537,9 @@ class ProviderAgent:
                     server_action = response.get("action", "CONTINUE")
                     node_status = response.get("status", "ONLINE")
 
-                    if server_action == "STOP":
+                    if server_action in ("STOP", "PAUSE") or node_status in ("STOPPED", "PAUSED"):
                         logger.warning(
-                            f"Coordinator signaled STOP (status={node_status}). Storage node paused by operator."
+                            f"Coordinator signaled {server_action} (status={node_status}). Storage node paused/stopped by operator."
                         )
                         self._is_paused = True
                     else:
