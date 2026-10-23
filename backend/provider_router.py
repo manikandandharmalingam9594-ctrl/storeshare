@@ -117,6 +117,7 @@ def get_node_status(
 
     if not node:
         return ProviderNodeStatusResponse(
+            node_id=None,
             configured=False,
             status="UNREGISTERED",
             storage_dir=None,
@@ -139,6 +140,7 @@ def get_node_status(
     warnings = _generate_node_warnings(node, effective_status)
 
     return ProviderNodeStatusResponse(
+        node_id=node.get("id"),
         configured=bool(node.get("storage_dir") and quota_bytes > 0),
         status=effective_status,
         storage_dir=node.get("storage_dir"),
@@ -201,6 +203,7 @@ def setup_node_storage(
     warnings = _generate_node_warnings(node, effective_status)
 
     return ProviderNodeStatusResponse(
+        node_id=node.get("id"),
         configured=True,
         status=effective_status,
         storage_dir=node["storage_dir"],

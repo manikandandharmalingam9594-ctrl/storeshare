@@ -23,8 +23,19 @@ export default function ProviderDashboard() {
   const [reconSearch, setReconSearch] = useState('')
   const [reconFilter, setReconFilter] = useState('ALL')
 
-  // Copy command feedback
+  // Copy feedback
   const [copiedCmd, setCopiedCmd] = useState(false)
+  const [copiedChunkId, setCopiedChunkId] = useState(null)
+
+  const copyText = (text, key) => {
+    try {
+      navigator.clipboard.writeText(text)
+      setCopiedChunkId(key)
+      setTimeout(() => setCopiedChunkId(null), 2000)
+    } catch (err) {
+      console.warn('Clipboard write failed:', err)
+    }
+  }
 
   // Fetch all telemetry data
   const fetchAllData = async (isInitial = false) => {
@@ -293,12 +304,26 @@ export default function ProviderDashboard() {
               <span className="telemetry-value">#{user?.id}</span>
             </div>
             <div className="telemetry-row">
+              <span className="telemetry-label">Storage Node ID:</span>
+              <span className="telemetry-value" style={{ fontWeight: 600, color: '#38bdf8' }}>
+                #{nodeStatus?.node_id ?? reconReport?.node_id ?? 'N/A'}
+              </span>
+            </div>
+            <div className="telemetry-row">
               <span className="telemetry-label">Email:</span>
               <span className="telemetry-value">{user?.email}</span>
             </div>
             <div className="telemetry-row">
-              <span className="telemetry-label">Role:</span>
-              <span className="telemetry-value success">{user?.role}</span>
+              <span className="telemetry-label">Storage Directory:</span>
+              <span className="telemetry-value" style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem' }}>
+                {nodeStatus?.storage_dir || 'Not configured'}
+              </span>
+            </div>
+            <div className="telemetry-row">
+              <span className="telemetry-label">Chunks Stored:</span>
+              <span className="telemetry-value success">
+                {reconReport?.items?.length ?? 0} chunk(s)
+              </span>
             </div>
             <div className="telemetry-row">
               <span className="telemetry-label">Computer Hostname:</span>
@@ -378,6 +403,225 @@ export default function ProviderDashboard() {
               </span>
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Stored Chunks & Cryptographic Inventory Card */}
+      <div className="glass-card" style={{ marginTop: '24px' }} id="stored-chunks-card">
+        <div className="card-header">
+          <div className="card-title-group">
+            <div className="card-icon-box">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                <polyline points="22 4 12 14.01 9 11.01" />
+              </svg>
+            </div>
+            <div>
+              <h3 className="card-title">Stored Chunks (Consumer Files on Disk)</h3>
+              <p className="card-desc" style={{ margin: 0 }}>
+                Physical encrypted file chunks stored on this host, validated with real-time SHA-256 cryptographic reconciliation.
+              </p>
+            </div>
+          </div>
+          <div className="status-badge idle">
+            <span>Reconciled: {reconReport ? new Date(reconReport.reconciled_at).toLocaleTimeString() : 'Pending'}</span>
+          </div>
+        </div>
+
+        {/* Multi-account notification if no chunks exist on current node */}
+        {(!reconReport || reconReport.items?.length === 0) && (
+          <div className="telemetry-warning-banner" style={{ marginBottom: '20px', borderColor: 'rgba(56, 189, 248, 0.3)', background: 'rgba(56, 189, 248, 0.08)' }}>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, marginTop: 2 }}>
+              <circle cx="12" cy="12" r="10" />
+              <line x1="12" y1="16" x2="12" y2="12" />
+              <line x1="12" y1="8" x2="12.01" y2="8" />
+            </svg>
+            <div>
+              <strong style={{ color: '#38bdf8' }}>No Chunks Found for Current Account ({user?.email})</strong>
+              <div style={{ marginTop: '4px', fontSize: '0.85rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                Provider Node <strong>#{nodeStatus?.node_id ?? reconReport?.node_id ?? 'N/A'}</strong> has 0 registered chunks.
+                {nodeStatus?.storage_dir && (
+                  <span> Configured directory: <code style={{ color: '#38bdf8' }}>{nodeStatus.storage_dir}</code>.</span>
+                )}
+              </div>
+              <div style={{ marginTop: '6px', fontSize: '0.85rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                📌 <em>Note:</em> If your background provider agent was started on <code>data/provider_storage</code> under <strong>local_provider@storeshare.io</strong>, sign in as <code>local_provider@storeshare.io</code> (password: <code>ProviderSecret123!</code>) to view those stored chunks and their live cryptographic audit.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 5-State Summary Metrics */}
+        <div className="recon-summary-grid">
+          <div className="recon-stat-card">
+            <span className="recon-stat-val" style={{ color: '#38bdf8' }}>{reconReport?.total_expected ?? 0}</span>
+            <span className="recon-stat-lbl">Expected Metadata</span>
+          </div>
+          <div className="recon-stat-card">
+            <span className="recon-stat-val" style={{ color: '#34d399' }}>{reconReport?.verified_count ?? 0}</span>
+            <span className="recon-stat-lbl">Verified Physical</span>
+          </div>
+          <div className="recon-stat-card">
+            <span className="recon-stat-val" style={{ color: '#f87171' }}>{reconReport?.missing_count ?? 0}</span>
+            <span className="recon-stat-lbl">Missing on Disk</span>
+          </div>
+          <div className="recon-stat-card">
+            <span className="recon-stat-val" style={{ color: '#fb7185' }}>{reconReport?.corrupted_count ?? 0}</span>
+            <span className="recon-stat-lbl">Corrupted Checksum</span>
+          </div>
+          <div className="recon-stat-card">
+            <span className="recon-stat-val" style={{ color: '#fbbf24' }}>{reconReport?.unexpected_count ?? 0}</span>
+            <span className="recon-stat-lbl">Unexpected / Orphan</span>
+          </div>
+          <div className="recon-stat-card">
+            <span className="recon-stat-val" style={{ color: '#94a3b8' }}>{reconReport?.unverified_count ?? 0}</span>
+            <span className="recon-stat-lbl">Unverified / Offline</span>
+          </div>
+        </div>
+
+        {/* Search & Filter Toolbar */}
+        <div style={{ display: 'flex', gap: '14px', marginBottom: '16px', flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            className="form-input"
+            placeholder="Search chunk ID, filename, or details..."
+            value={reconSearch}
+            onChange={(e) => setReconSearch(e.target.value)}
+            style={{ flex: 1, minWidth: '220px' }}
+          />
+          <select
+            className="form-input"
+            value={reconFilter}
+            onChange={(e) => setReconFilter(e.target.value)}
+            style={{ width: '200px' }}
+          >
+            <option value="ALL">All States ({reconReport?.items?.length ?? 0})</option>
+            <option value="VERIFIED">Verified Only ({reconReport?.verified_count ?? 0})</option>
+            <option value="MISSING">Missing Only ({reconReport?.missing_count ?? 0})</option>
+            <option value="CORRUPTED">Corrupted Only ({reconReport?.corrupted_count ?? 0})</option>
+            <option value="UNEXPECTED">Unexpected Only ({reconReport?.unexpected_count ?? 0})</option>
+            <option value="UNVERIFIED">Unverified Only ({reconReport?.unverified_count ?? 0})</option>
+          </select>
+        </div>
+
+        {/* Stored Chunks Table */}
+        <div style={{ overflowX: 'auto', background: 'rgba(5, 8, 15, 0.7)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.06)' }}>
+          <table className="jobs-table">
+            <thead>
+              <tr>
+                <th>Chunk ID</th>
+                <th>Consumer File</th>
+                <th>Physical Storage Path</th>
+                <th>Size (Disk / Expected)</th>
+                <th>SHA-256 Checksum</th>
+                <th>Physical State</th>
+                <th>Audit Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredReconRecords.length === 0 ? (
+                <tr>
+                  <td colSpan="7" style={{ textAlign: 'center', padding: '28px', color: 'var(--text-muted)' }}>
+                    No chunk records found for this node.
+                  </td>
+                </tr>
+              ) : (
+                filteredReconRecords.map((item) => {
+                  let badgeClass = 'badge-recon-unverified'
+                  if (item.status === 'VERIFIED') badgeClass = 'badge-recon-verified'
+                  else if (item.status === 'MISSING') badgeClass = 'badge-recon-missing'
+                  else if (item.status === 'CORRUPTED') badgeClass = 'badge-recon-corrupted'
+                  else if (item.status === 'UNEXPECTED') badgeClass = 'badge-recon-unexpected'
+
+                  const chunkFilePath = `${nodeStatus?.storage_dir || 'data/provider_storage'}\\chunks\\${item.chunk_id}`
+
+                  return (
+                    <tr key={item.chunk_id}>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.82rem', color: '#38bdf8' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <span title={item.chunk_id}>
+                            {item.chunk_id.length > 22 ? `${item.chunk_id.substring(0, 10)}...${item.chunk_id.substring(item.chunk_id.length - 8)}` : item.chunk_id}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => copyText(item.chunk_id, item.chunk_id)}
+                            style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '2px', fontSize: '0.75rem' }}
+                            title="Copy full Chunk ID"
+                          >
+                            {copiedChunkId === item.chunk_id ? '✓' : '📋'}
+                          </button>
+                        </div>
+                      </td>
+                      <td>
+                        {item.filename ? (
+                          <div>
+                            <span style={{ fontWeight: 600, color: '#f8fafc' }}>{item.filename}</span>
+                            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block' }}>File #{item.file_id}</span>
+                          </div>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)' }}>Unassigned</span>
+                        )}
+                      </td>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-secondary)', maxWidth: '240px', wordBreak: 'break-all' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <span title={chunkFilePath}>{chunkFilePath}</span>
+                          <button
+                            type="button"
+                            onClick={() => copyText(chunkFilePath, `path_${item.chunk_id}`)}
+                            style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '2px', fontSize: '0.75rem' }}
+                            title="Copy full file path"
+                          >
+                            {copiedChunkId === `path_${item.chunk_id}` ? '✓' : '📋'}
+                          </button>
+                        </div>
+                      </td>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem' }}>
+                        {item.actual_size_bytes != null ? (
+                          <div>
+                            <span>{(item.actual_size_bytes / 1024).toFixed(1)} KB</span>
+                            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block' }}>
+                              ({item.actual_size_bytes.toLocaleString()} bytes)
+                            </span>
+                          </div>
+                        ) : item.expected_size_bytes != null ? (
+                          <span style={{ color: '#f87171' }}>Missing ({item.expected_size_bytes} B)</span>
+                        ) : (
+                          'N/A'
+                        )}
+                      </td>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}>
+                        {item.actual_checksum ? (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <span title={`SHA-256: ${item.actual_checksum}`}>
+                              {item.actual_checksum.substring(0, 12)}...
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => copyText(item.actual_checksum, `hash_${item.chunk_id}`)}
+                              style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '2px', fontSize: '0.75rem' }}
+                              title="Copy full SHA-256 checksum"
+                            >
+                              {copiedChunkId === `hash_${item.chunk_id}` ? '✓' : '📋'}
+                            </button>
+                          </div>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)' }}>None</span>
+                        )}
+                      </td>
+                      <td>
+                        <span className={`badge-recon ${badgeClass}`}>
+                          {item.status}
+                        </span>
+                      </td>
+                      <td style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+                        {item.status_detail}
+                      </td>
+                    </tr>
+                  )
+                })
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -523,157 +767,6 @@ export default function ProviderDashboard() {
             </button>
           </div>
         </form>
-      </div>
-
-      {/* Step 3: Physical Chunk Inventory & Cryptographic Reconciliation Card */}
-      <div className="glass-card" style={{ marginTop: '24px' }}>
-        <div className="card-header">
-          <div className="card-title-group">
-            <div className="card-icon-box">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
-                <polyline points="22 4 12 14.01 9 11.01" />
-              </svg>
-            </div>
-            <div>
-              <h3 className="card-title">Physical Chunk Inventory & Reconciliation</h3>
-              <p className="card-desc" style={{ margin: 0 }}>
-                Compares actual chunk files physically on provider disk against coordinator metadata across 5 integrity states.
-              </p>
-            </div>
-          </div>
-          <div className="status-badge idle">
-            <span>Reconciled: {reconReport ? new Date(reconReport.reconciled_at).toLocaleTimeString() : 'Pending'}</span>
-          </div>
-        </div>
-
-        {/* 5-State Summary Metrics */}
-        <div className="recon-summary-grid">
-          <div className="recon-stat-card">
-            <span className="recon-stat-val" style={{ color: '#38bdf8' }}>{reconReport?.total_expected ?? 0}</span>
-            <span className="recon-stat-lbl">Expected Metadata</span>
-          </div>
-          <div className="recon-stat-card">
-            <span className="recon-stat-val" style={{ color: '#34d399' }}>{reconReport?.verified_count ?? 0}</span>
-            <span className="recon-stat-lbl">Verified Physical</span>
-          </div>
-          <div className="recon-stat-card">
-            <span className="recon-stat-val" style={{ color: '#f87171' }}>{reconReport?.missing_count ?? 0}</span>
-            <span className="recon-stat-lbl">Missing on Disk</span>
-          </div>
-          <div className="recon-stat-card">
-            <span className="recon-stat-val" style={{ color: '#fb7185' }}>{reconReport?.corrupted_count ?? 0}</span>
-            <span className="recon-stat-lbl">Corrupted Checksum</span>
-          </div>
-          <div className="recon-stat-card">
-            <span className="recon-stat-val" style={{ color: '#fbbf24' }}>{reconReport?.unexpected_count ?? 0}</span>
-            <span className="recon-stat-lbl">Unexpected / Orphan</span>
-          </div>
-          <div className="recon-stat-card">
-            <span className="recon-stat-val" style={{ color: '#94a3b8' }}>{reconReport?.unverified_count ?? 0}</span>
-            <span className="recon-stat-lbl">Unverified / Offline</span>
-          </div>
-        </div>
-
-        {/* Search & Filter Toolbar */}
-        <div style={{ display: 'flex', gap: '14px', marginBottom: '16px', flexWrap: 'wrap' }}>
-          <input
-            type="text"
-            className="form-input"
-            placeholder="Search chunk ID, filename, or details..."
-            value={reconSearch}
-            onChange={(e) => setReconSearch(e.target.value)}
-            style={{ flex: 1, minWidth: '220px' }}
-          />
-          <select
-            className="form-input"
-            value={reconFilter}
-            onChange={(e) => setReconFilter(e.target.value)}
-            style={{ width: '200px' }}
-          >
-            <option value="ALL">All States ({reconReport?.items?.length ?? 0})</option>
-            <option value="VERIFIED">Verified Only ({reconReport?.verified_count ?? 0})</option>
-            <option value="MISSING">Missing Only ({reconReport?.missing_count ?? 0})</option>
-            <option value="CORRUPTED">Corrupted Only ({reconReport?.corrupted_count ?? 0})</option>
-            <option value="UNEXPECTED">Unexpected Only ({reconReport?.unexpected_count ?? 0})</option>
-            <option value="UNVERIFIED">Unverified Only ({reconReport?.unverified_count ?? 0})</option>
-          </select>
-        </div>
-
-        {/* Reconciliation Table */}
-        <div style={{ overflowX: 'auto', background: 'rgba(5, 8, 15, 0.7)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.06)' }}>
-          <table className="jobs-table">
-            <thead>
-              <tr>
-                <th>Chunk ID</th>
-                <th>File / Filename</th>
-                <th>Expected Size</th>
-                <th>Actual Disk Size</th>
-                <th>Integrity Checksum (SHA-256)</th>
-                <th>Physical State</th>
-                <th>Audit Detail</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredReconRecords.length === 0 ? (
-                <tr>
-                  <td colSpan="7" style={{ textAlign: 'center', padding: '24px', color: 'var(--text-muted)' }}>
-                    No chunk records found matching current filter.
-                  </td>
-                </tr>
-              ) : (
-                filteredReconRecords.map((item) => {
-                  let badgeClass = 'badge-recon-unverified'
-                  if (item.status === 'VERIFIED') badgeClass = 'badge-recon-verified'
-                  else if (item.status === 'MISSING') badgeClass = 'badge-recon-missing'
-                  else if (item.status === 'CORRUPTED') badgeClass = 'badge-recon-corrupted'
-                  else if (item.status === 'UNEXPECTED') badgeClass = 'badge-recon-unexpected'
-
-                  return (
-                    <tr key={item.chunk_id}>
-                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.82rem', color: '#38bdf8' }}>
-                        {item.chunk_id.length > 24 ? `${item.chunk_id.substring(0, 10)}...${item.chunk_id.substring(item.chunk_id.length - 8)}` : item.chunk_id}
-                      </td>
-                      <td>
-                        {item.filename ? (
-                          <div>
-                            <span style={{ fontWeight: 600 }}>{item.filename}</span>
-                            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block' }}>File #{item.file_id}</span>
-                          </div>
-                        ) : (
-                          <span style={{ color: 'var(--text-muted)' }}>Unassigned</span>
-                        )}
-                      </td>
-                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem' }}>
-                        {item.expected_size_bytes != null ? `${(item.expected_size_bytes / 1024).toFixed(1)} KB` : 'N/A'}
-                      </td>
-                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem' }}>
-                        {item.actual_size_bytes != null ? `${(item.actual_size_bytes / 1024).toFixed(1)} KB` : <span style={{ color: '#f87171' }}>Missing</span>}
-                      </td>
-                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}>
-                        {item.actual_checksum ? (
-                          <span title={`SHA-256: ${item.actual_checksum}`}>
-                            {item.actual_checksum.substring(0, 12)}...
-                          </span>
-                        ) : (
-                          <span style={{ color: 'var(--text-muted)' }}>None</span>
-                        )}
-                      </td>
-                      <td>
-                        <span className={`badge-recon ${badgeClass}`}>
-                          {item.status}
-                        </span>
-                      </td>
-                      <td style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
-                        {item.status_detail}
-                      </td>
-                    </tr>
-                  )
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
       </div>
 
       {/* Step 4: Provider Health & Asynchronous Job Transfer Audit Card */}

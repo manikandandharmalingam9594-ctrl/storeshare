@@ -165,6 +165,7 @@ class ProviderNodeStatusResponse(BaseModel):
     """
     Storage node status response for provider console.
     """
+    node_id: Optional[int] = None
     configured: bool
     status: str
     storage_dir: Optional[str] = None
