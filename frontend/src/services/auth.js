@@ -177,13 +177,14 @@ export const authApi = {
   /**
    * Storage Provider Node APIs
    */
-  async getNodeStatus() {
+  async getNodeStatus(nodeId = null) {
     const token = getToken()
     if (!token) {
       throw new Error('Authentication token required.')
     }
 
-    const response = await fetch('/api/provider/node', {
+    const url = nodeId ? `/api/provider/node?node_id=${encodeURIComponent(nodeId)}` : '/api/provider/node'
+    const response = await fetch(url, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -197,10 +198,39 @@ export const authApi = {
     return await response.json()
   },
 
-  async setupNodeStorage(storage_dir, quota_gb, action = 'START') {
+  async getProviderNodes() {
     const token = getToken()
     if (!token) {
       throw new Error('Authentication token required.')
+    }
+
+    const response = await fetch('/api/provider/nodes', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+      },
+    })
+
+    if (!response.ok) {
+      throw await parseApiError(response)
+    }
+
+    return await response.json()
+  },
+
+  async setupNodeStorage(storage_dir, quota_gb, action = 'START', nodeId = null) {
+    const token = getToken()
+    if (!token) {
+      throw new Error('Authentication token required.')
+    }
+
+    const bodyPayload = {
+      storage_dir: storage_dir.trim(),
+      quota_gb: parseFloat(quota_gb),
+      action,
+    }
+    if (nodeId != null) {
+      bodyPayload.node_id = nodeId
     }
 
     const response = await fetch('/api/provider/node/setup', {
@@ -209,11 +239,7 @@ export const authApi = {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        storage_dir: storage_dir.trim(),
-        quota_gb: parseFloat(quota_gb),
-        action,
-      }),
+      body: JSON.stringify(bodyPayload),
     })
 
     if (!response.ok) {
@@ -226,13 +252,14 @@ export const authApi = {
   /**
    * Provider Physical Chunk Reconciliation API
    */
-  async getProviderReconciliation() {
+  async getProviderReconciliation(nodeId = null) {
     const token = getToken()
     if (!token) {
       throw new Error('Authentication token required.')
     }
 
-    const response = await fetch('/api/provider/reconciliation', {
+    const url = nodeId ? `/api/provider/reconciliation?node_id=${encodeURIComponent(nodeId)}` : '/api/provider/reconciliation'
+    const response = await fetch(url, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -249,13 +276,18 @@ export const authApi = {
   /**
    * Provider Asynchronous Job History & Health Telemetry API
    */
-  async getProviderJobHistory(limit = 20) {
+  async getProviderJobHistory(limit = 20, nodeId = null) {
     const token = getToken()
     if (!token) {
       throw new Error('Authentication token required.')
     }
 
-    const response = await fetch(`/api/provider/jobs/history?limit=${limit}`, {
+    let url = `/api/provider/jobs/history?limit=${limit}`
+    if (nodeId != null) {
+      url += `&node_id=${encodeURIComponent(nodeId)}`
+    }
+
+    const response = await fetch(url, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${token}`,

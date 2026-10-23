@@ -57,18 +57,40 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Enable CORS for frontend development
+# Configure CORS origins for cross-computer and local development
+default_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+env_origins = os.getenv("STORESHARE_CORS_ORIGINS", "").strip()
+if env_origins:
+    if env_origins == "*":
+        allow_origins = ["*"]
+        allow_credentials = False
+    else:
+        allow_origins = [o.strip() for o in env_origins.split(",") if o.strip()]
+        allow_credentials = True
+else:
+    allow_origins = default_origins
+    allow_credentials = True
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Content-Disposition",
+        "X-IV-Hex",
+        "X-SHA256-Checksum",
+        "X-Plaintext-Size",
+        "X-Encrypted-Size",
+        "X-Chunk-ID",
+        "X-Chunk-Size",
+    ],
 )
 
 # Mount routers

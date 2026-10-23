@@ -12,6 +12,7 @@ Features:
 """
 
 from datetime import datetime, timezone
+import hashlib
 import logging
 import signal
 import socket
@@ -19,6 +20,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+from pathlib import Path
 import httpx
 
 from provider_agent.config import AgentConfig
@@ -246,6 +248,20 @@ class ProviderAgent:
             logger.info(f"Coordinator updated quota to {server_quota} bytes. Syncing local storage manager...")
             self.storage.set_quota(server_quota)
 
+        # Dynamic coordinator storage directory synchronization with safe migration
+        server_storage_dir = data.get("storage_dir")
+        if server_storage_dir:
+            try:
+                if Path(server_storage_dir).resolve() != Path(self.storage.storage_dir).resolve():
+                    logger.info(
+                        f"Coordinator updated storage directory to '{server_storage_dir}'. "
+                        f"Migrating from '{self.storage.storage_dir}' safely..."
+                    )
+                    self.storage.change_storage_dir(server_storage_dir, migrate_existing=True)
+                    logger.info(f"Storage directory successfully migrated to '{server_storage_dir}'.")
+            except Exception as exc:
+                logger.error(f"Failed to migrate storage directory to '{server_storage_dir}': {exc}")
+
         server_action = data.get("action")
         node_status = data.get("status")
         if server_action in ("STOP", "PAUSE") or node_status in ("STOPPED", "PAUSED"):
@@ -306,6 +322,7 @@ class ProviderAgent:
     def fetch_job_data(self, job_id: int) -> bytes:
         """
         Download transient chunk payload from coordinator for a STORE_CHUNK job.
+        Verifies SHA-256 integrity if X-SHA256-Checksum header is provided.
         """
         if not self.token:
             self.authenticate()
@@ -323,7 +340,16 @@ class ProviderAgent:
             )
         if res.status_code != 200:
             raise RuntimeError(f"Failed to download job data (HTTP {res.status_code}): {res.text}")
-        return res.content
+
+        content = res.content
+        expected_sha = res.headers.get("X-SHA256-Checksum")
+        if expected_sha:
+            computed_sha = hashlib.sha256(content).hexdigest()
+            if computed_sha.lower() != expected_sha.lower():
+                raise RuntimeError(
+                    f"Integrity check failed for job #{job_id}: expected SHA-256 {expected_sha}, got {computed_sha}"
+                )
+        return content
 
     def upload_job_data(self, job_id: int, data: bytes) -> Dict[str, Any]:
         """
@@ -432,10 +458,39 @@ class ProviderAgent:
 
         try:
             if job_type == "STORE_CHUNK":
-                # 1. Fetch ciphertext from coordinator
-                ciphertext = self.fetch_job_data(job_id)
-                # 2. Write to local storage atomically
-                written_bytes = self.storage.write_chunk_atomic(chunk_id, ciphertext)
+                chunk_size = job.get("chunk_size")
+                pre_reserved = False
+                if chunk_size and chunk_size > 0:
+                    try:
+                        self.storage.reserve_space(chunk_size)
+                        pre_reserved = True
+                    except Exception as res_err:
+                        err_msg = f"Storage reservation failed ({res_err})"
+                        logger.error(f"Job #{job_id}: {err_msg}")
+                        self.fail_job(job_id, err_msg)
+                        return False
+
+                try:
+                    # 1. Fetch ciphertext from coordinator (verifies SHA-256 header)
+                    ciphertext = self.fetch_job_data(job_id)
+                except Exception:
+                    if pre_reserved:
+                        self.storage.release_reservation(chunk_size)
+                    raise
+
+                # 2. Write to local storage atomically (handles its own reservation release on failure)
+                try:
+                    if pre_reserved:
+                        written_bytes = self.storage.write_chunk_atomic(
+                            chunk_id, ciphertext, pre_reserved=True
+                        )
+                    else:
+                        written_bytes = self.storage.write_chunk_atomic(chunk_id, ciphertext)
+                except TypeError as type_err:
+                    if "pre_reserved" in str(type_err):
+                        written_bytes = self.storage.write_chunk_atomic(chunk_id, ciphertext)
+                    else:
+                        raise
                 logger.info(f"Job #{job_id}: Atomically wrote {written_bytes} bytes for chunk '{chunk_id}'.")
                 # 3. Acknowledge success to coordinator
                 self.complete_job(job_id)

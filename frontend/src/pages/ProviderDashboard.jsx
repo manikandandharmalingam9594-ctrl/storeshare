@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react'
 import { useAuth } from '../context/AuthContext'
-import { authApi } from '../services/auth'
+import { authApi, getToken } from '../services/auth'
 
 export default function ProviderDashboard() {
   const { user } = useAuth()
 
   // Storage node status state from coordinator
   const [nodeStatus, setNodeStatus] = useState(null)
+  const [selectedNodeId, setSelectedNodeId] = useState(null)
+  const [cmdAuthMode, setCmdAuthMode] = useState('token') // 'token' or 'password'
   const [reconReport, setReconReport] = useState(null)
   const [jobTelemetry, setJobTelemetry] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -38,24 +40,28 @@ export default function ProviderDashboard() {
   }
 
   // Fetch all telemetry data
-  const fetchAllData = async (isInitial = false) => {
+  const fetchAllData = async (isInitial = false, overrideNodeId = undefined) => {
+    const targetNodeId = overrideNodeId !== undefined ? overrideNodeId : selectedNodeId
     if (isInitial) setLoading(true)
     else setRefreshing(true)
 
     try {
       const [status, recon, jobs] = await Promise.allSettled([
-        authApi.getNodeStatus(),
-        authApi.getProviderReconciliation(),
-        authApi.getProviderJobHistory(25),
+        authApi.getNodeStatus(targetNodeId),
+        authApi.getProviderReconciliation(targetNodeId),
+        authApi.getProviderJobHistory(25, targetNodeId),
       ])
 
       if (status.status === 'fulfilled') {
         setNodeStatus(status.value)
-        if (status.value.storage_dir && isInitial) {
+        if (status.value.storage_dir && (isInitial || overrideNodeId !== undefined)) {
           setStorageDir(status.value.storage_dir)
         }
-        if (status.value.quota_gb && isInitial) {
+        if (status.value.quota_gb && (isInitial || overrideNodeId !== undefined)) {
           setQuotaGb(status.value.quota_gb.toString())
+        }
+        if (targetNodeId == null && status.value.node_id) {
+          setSelectedNodeId(status.value.node_id)
         }
       }
 
@@ -81,7 +87,7 @@ export default function ProviderDashboard() {
       fetchAllData(false)
     }, 5000)
     return () => clearInterval(interval)
-  }, [])
+  }, [selectedNodeId])
 
   const executeNodeAction = async (action) => {
     setFormSuccess(null)
@@ -101,7 +107,7 @@ export default function ProviderDashboard() {
 
     setFormSubmitting(true)
     try {
-      const updated = await authApi.setupNodeStorage(trimmedDir, parsedQuota, action)
+      const updated = await authApi.setupNodeStorage(trimmedDir, parsedQuota, action, selectedNodeId)
       setNodeStatus(updated)
 
       if (action === 'PAUSE') {
@@ -196,7 +202,10 @@ export default function ProviderDashboard() {
   }
 
   // CLI command string for local provider agent
-  const agentCliCommand = `powershell -Command "$env:PYTHONPATH='.'; .venv\\Scripts\\python -m provider_agent --storage-dir \\"${storageDir || 'C:\\storeshare-storage'}\\" --quota-gb ${quotaGb || 50} --coordinator-url http://127.0.0.1:8001 --email ${user?.email || 'provider@example.com'} --password <your_password>"`
+  const sessionToken = getToken() || '<your_jwt_token>'
+  const agentCliCommand = cmdAuthMode === 'token'
+    ? `powershell -Command "$env:PYTHONPATH='.'; .venv\\Scripts\\python -m provider_agent --storage-dir \\"${storageDir || 'C:\\storeshare-storage'}\\" --quota-gb ${quotaGb || 50} --coordinator-url http://127.0.0.1:8001 --token ${sessionToken}"`
+    : `powershell -Command "$env:PYTHONPATH='.'; .venv\\Scripts\\python -m provider_agent --storage-dir \\"${storageDir || 'C:\\storeshare-storage'}\\" --quota-gb ${quotaGb || 50} --coordinator-url http://127.0.0.1:8001 --email ${user?.email || 'provider@example.com'} --password <your_password>"`
 
   const handleCopyCommand = () => {
     navigator.clipboard.writeText(agentCliCommand)
@@ -255,6 +264,31 @@ export default function ProviderDashboard() {
         <p className="hero-subtitle">
           Manage physical disk allocations, enforce storage quotas, and inspect real-time cryptographic reconciliation of stored encrypted chunks.
         </p>
+
+        {nodeStatus?.all_nodes && nodeStatus.all_nodes.length > 1 && (
+          <div style={{ marginTop: '16px', display: 'flex', alignItems: 'center', gap: '12px', background: 'rgba(255,255,255,0.05)', padding: '10px 16px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', width: 'fit-content' }}>
+            <span style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)' }}>Storage Node:</span>
+            <select
+              value={selectedNodeId || nodeStatus.node_id || ''}
+              onChange={(e) => {
+                const newId = Number(e.target.value)
+                setSelectedNodeId(newId)
+                fetchAllData(false, newId)
+              }}
+              className="form-input"
+              style={{ width: 'auto', minWidth: '240px', padding: '4px 10px', fontSize: '0.85rem' }}
+            >
+              {nodeStatus.all_nodes.map((n) => (
+                <option key={n.id} value={n.id}>
+                  Node #{n.id} ({n.computer_name || 'Host'}) - {n.storage_dir || 'No dir'} [{n.status}]
+                </option>
+              ))}
+            </select>
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+              ({nodeStatus.all_nodes.length} nodes registered)
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Warnings & Actionable Alerts */}
@@ -864,6 +898,26 @@ export default function ProviderDashboard() {
         <p className="card-desc">
           Run the provider daemon on your computer using Python. It connects outward to the coordinator, validates filesystem space, enforces storage quota limits, rejects unsafe symlinks, and performs atomic fsync chunk operations.
         </p>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Launch Command Format:</span>
+          <button
+            type="button"
+            onClick={() => setCmdAuthMode('token')}
+            className={`action-btn small ${cmdAuthMode === 'token' ? '' : 'secondary'}`}
+            style={{ width: 'auto', padding: '4px 12px', fontSize: '0.8rem' }}
+          >
+            Session Token (1-Click Run)
+          </button>
+          <button
+            type="button"
+            onClick={() => setCmdAuthMode('password')}
+            className={`action-btn small ${cmdAuthMode === 'password' ? '' : 'secondary'}`}
+            style={{ width: 'auto', padding: '4px 12px', fontSize: '0.8rem' }}
+          >
+            Email & Password
+          </button>
+        </div>
 
         <div style={{ background: '#05080f', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '10px', padding: '16px', position: 'relative' }}>
           <pre style={{ margin: 0, fontFamily: 'var(--font-mono)', fontSize: '0.85rem', color: '#38bdf8', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>

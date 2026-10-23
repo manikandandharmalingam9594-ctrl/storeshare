@@ -119,6 +119,7 @@ class ProviderSetupRequest(BaseModel):
     quota_gb: float = Field(..., description="Allocated storage quota in Gigabytes")
     action: str = Field(default="START", description="Action to perform: START, STOP, or UPDATE")
     computer_name: Optional[str] = Field(default=None, description="Physical hostname or computer name of provider host")
+    node_id: Optional[int] = Field(default=None, description="Explicit provider node ID if account manages multiple nodes")
 
     @field_validator("storage_dir")
     @classmethod
@@ -178,6 +179,8 @@ class ProviderNodeStatusResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list)
     last_heartbeat: Optional[str] = None
     is_online: bool
+    total_nodes: int = 1
+    all_nodes: Optional[List[Dict[str, Any]]] = None
 
 
 class ProviderHeartbeatResponse(BaseModel):
@@ -187,6 +190,7 @@ class ProviderHeartbeatResponse(BaseModel):
     status: str
     action: str = "CONTINUE"
     quota_bytes: Optional[int] = None
+    storage_dir: Optional[str] = None
     server_time: str
 
 
@@ -271,6 +275,7 @@ class ChunkJobResponse(BaseModel):
     status: str
     expires_at: str
     error_message: Optional[str] = None
+    chunk_size: Optional[int] = None
 
 
 class JobFailRequest(BaseModel):

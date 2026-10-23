@@ -393,8 +393,8 @@ async def download_encrypted_file(
             f"Provider Node #{chunk['provider_node_id']}. Waiting for provider handoff..."
         )
 
-        # Await provider agent upload to coordinator spool (up to 12 seconds in 0.2s steps)
-        for _ in range(60):
+        # Await provider agent upload to coordinator spool (up to 30 seconds in 0.2s steps)
+        for _ in range(150):
             await asyncio.sleep(0.2)
             ciphertext = get_spool_chunk(chunk["chunk_id"])
             if ciphertext is not None:

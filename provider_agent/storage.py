@@ -61,8 +61,8 @@ class StorageManager:
         self.quota_bytes = int(quota_bytes)
         self.chunks_dir = self.storage_dir / "chunks"
 
-        # Concurrency lock for quota reservations and writes
-        self._lock = threading.Lock()
+        # Concurrency lock for quota reservations and writes (re-entrant)
+        self._lock = threading.RLock()
         self._used_bytes: int = 0
         self._reserved_bytes: int = 0
 
@@ -341,6 +341,15 @@ class StorageManager:
         except Exception as exc:
             raise StorageError(f"Failed to read chunk {chunk_id}: {exc}") from exc
 
+    def chunk_exists(self, chunk_id: str) -> bool:
+        """
+        Check if a given chunk physically exists on disk.
+        """
+        try:
+            return self.get_safe_chunk_path(chunk_id).is_file()
+        except Exception:
+            return False
+
     def delete_chunk(self, chunk_id: str) -> bool:
         """
         Safely delete a stored chunk and update committed quota accounting.
@@ -522,4 +531,61 @@ class StorageManager:
                 "error": str(exc),
                 "is_valid": False,
             }
+
+    def change_storage_dir(
+        self,
+        new_storage_dir: str | Path,
+        migrate_existing: bool = True,
+    ) -> int:
+        """
+        Safely changes the storage directory.
+        If migrate_existing is True and chunks exist in the old directory,
+        migrates (copies with fsync) all valid chunk files to the new directory
+        without corrupting, orphaning, or deleting them.
+        Returns the number of chunks successfully migrated.
+        """
+        new_path = Path(new_storage_dir).resolve()
+        with self._lock:
+            if new_path == self.storage_dir:
+                return 0
+
+            old_chunks_dir = self.chunks_dir
+
+            # Validate new directory
+            self.raw_dir_path = str(new_storage_dir)
+            self.storage_dir = new_path
+            self.chunks_dir = self.storage_dir / "chunks"
+
+            self._init_and_validate_directory(create_if_missing=True)
+            self._validate_free_space()
+
+            migrated_count = 0
+            if migrate_existing and old_chunks_dir.exists():
+                for entry in old_chunks_dir.iterdir():
+                    try:
+                        if entry.is_file() and not entry.is_symlink() and not entry.name.startswith(".tmp_"):
+                            if CHUNK_ID_PATTERN.match(entry.name):
+                                dest = self.chunks_dir / entry.name
+                                if not dest.exists():
+                                    tmp_dest = self.chunks_dir / f".tmp_mig_{uuid.uuid4().hex}"
+                                    with open(entry, "rb") as src_f, open(tmp_dest, "wb") as dst_f:
+                                        shutil.copyfileobj(src_f, dst_f)
+                                        dst_f.flush()
+                                        os.fsync(dst_f.fileno())
+                                    os.replace(tmp_dest, dest)
+                                    migrated_count += 1
+                                # Verify destination and safely remove old copy
+                                if dest.exists() and dest.stat().st_size == entry.stat().st_size:
+                                    entry.unlink(missing_ok=True)
+                    except Exception as exc:
+                        logger.warning(f"Error migrating chunk file {entry.name}: {exc}")
+
+            # Rescan chunks and calculate committed usage in new directory
+            self._scan_and_cleanup()
+            logger.info(
+                f"Storage directory updated to '{self.storage_dir}'. "
+                f"Migrated: {migrated_count} chunks. Total in new dir: {self._used_bytes} bytes."
+            )
+            return migrated_count
+
 

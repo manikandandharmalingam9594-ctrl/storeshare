@@ -713,10 +713,50 @@ def create_user(
 # Provider Node Telemetry & Allocation Helpers
 # ==============================================================================
 
-def get_provider_node(provider_id: int, db_path: Optional[Union[Path, str]] = None) -> Optional[Dict[str, Any]]:
+def get_provider_node(
+    provider_id: int,
+    node_id: Optional[int] = None,
+    db_path: Optional[Union[Path, str]] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    Retrieve provider node record by provider user ID.
+    Retrieve provider node record by provider user ID (and optional specific node ID).
+    If node_id is omitted, returns the latest/active node for this provider.
     Returns None if node has not been initialized.
+    """
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        if node_id is not None:
+            cursor.execute(
+                """
+                SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, free_disk_bytes, status, last_heartbeat, computer_name, last_inventory, created_at, updated_at
+                FROM provider_nodes
+                WHERE provider_id = ? AND id = ?;
+                """,
+                (provider_id, node_id),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, free_disk_bytes, status, last_heartbeat, computer_name, last_inventory, created_at, updated_at
+                FROM provider_nodes
+                WHERE provider_id = ?
+                ORDER BY last_heartbeat DESC NULLS LAST, updated_at DESC, id DESC
+                LIMIT 1;
+                """,
+                (provider_id,),
+            )
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+        return None
+
+
+def get_provider_nodes_by_user_id(
+    provider_id: int,
+    db_path: Optional[Union[Path, str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve all provider storage nodes registered for a given user account.
     """
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -724,14 +764,13 @@ def get_provider_node(provider_id: int, db_path: Optional[Union[Path, str]] = No
             """
             SELECT id, provider_id, storage_dir, quota_bytes, used_bytes, reserved_bytes, free_disk_bytes, status, last_heartbeat, computer_name, last_inventory, created_at, updated_at
             FROM provider_nodes
-            WHERE provider_id = ?;
+            WHERE provider_id = ?
+            ORDER BY id ASC;
             """,
             (provider_id,),
         )
-        row = cursor.fetchone()
-        if row:
-            return dict(row)
-        return None
+        return [dict(r) for r in cursor.fetchall()]
+
 
 
 def upsert_provider_node(
@@ -1380,21 +1419,26 @@ def poll_provider_jobs(
                 pg_placeholders = ",".join("%s" for _ in exclude_job_types)
                 pg_exclude_clause = f"AND job_type NOT IN ({pg_placeholders})"
             query = f"""
-            UPDATE chunk_jobs
-            SET status = 'PROCESSING',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id IN (
-                SELECT id
-                FROM chunk_jobs
-                WHERE provider_node_id = %s
-                  AND status = 'QUEUED'
-                  AND expires_at > CURRENT_TIMESTAMP
-                  {pg_exclude_clause}
-                ORDER BY created_at ASC
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
+            WITH updated AS (
+                UPDATE chunk_jobs
+                SET status = 'PROCESSING',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id IN (
+                    SELECT id
+                    FROM chunk_jobs
+                    WHERE provider_node_id = %s
+                      AND status = 'QUEUED'
+                      AND expires_at > CURRENT_TIMESTAMP
+                      {pg_exclude_clause}
+                    ORDER BY created_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, provider_node_id, chunk_id, file_id, job_type, status, expires_at, error_message, created_at, updated_at
             )
-            RETURNING id, provider_node_id, chunk_id, file_id, job_type, status, expires_at, error_message, created_at, updated_at;
+            SELECT u.*, fc.chunk_size
+            FROM updated u
+            LEFT JOIN file_chunks fc ON fc.chunk_id = u.chunk_id;
             """
             cursor.execute(query, (provider_node_id, *exclude_params, limit))
             jobs = cursor.fetchall()
@@ -1406,13 +1450,14 @@ def poll_provider_jobs(
             cursor.execute("BEGIN IMMEDIATE;")
             cursor.execute(
                 f"""
-                SELECT id, provider_node_id, chunk_id, file_id, job_type, status, expires_at, error_message, created_at, updated_at
-                FROM chunk_jobs
-                WHERE provider_node_id = ?
-                  AND status = 'QUEUED'
-                  AND expires_at > CURRENT_TIMESTAMP
+                SELECT cj.id, cj.provider_node_id, cj.chunk_id, cj.file_id, cj.job_type, cj.status, cj.expires_at, cj.error_message, cj.created_at, cj.updated_at, fc.chunk_size
+                FROM chunk_jobs cj
+                LEFT JOIN file_chunks fc ON fc.chunk_id = cj.chunk_id
+                WHERE cj.provider_node_id = ?
+                  AND cj.status = 'QUEUED'
+                  AND cj.expires_at > CURRENT_TIMESTAMP
                   {exclude_clause}
-                ORDER BY created_at ASC
+                ORDER BY cj.created_at ASC
                 LIMIT ?;
                 """,
                 (provider_node_id, *exclude_params, limit),

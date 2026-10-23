@@ -15,6 +15,7 @@ from backend.database import (
     get_file_by_id,
     get_provider_job_telemetry,
     get_provider_node,
+    get_provider_nodes_by_user_id,
     get_provider_reconciliation_records,
     poll_provider_jobs,
     record_provider_heartbeat,
@@ -104,16 +105,34 @@ def _generate_node_warnings(node: Dict[str, Any], effective_status: str) -> List
     return warnings
 
 
+@router.get("/nodes", summary="List All Nodes For Authenticated Provider")
+def list_provider_nodes(
+    provider_user: Dict[str, Any] = Depends(require_provider),
+) -> List[Dict[str, Any]]:
+    """
+    List all storage nodes owned by the authenticated provider.
+    """
+    provider_id = provider_user["id"]
+    nodes = get_provider_nodes_by_user_id(provider_id)
+    for n in nodes:
+        n["effective_status"] = _compute_effective_status(n)
+        n["is_online"] = n["effective_status"] in ("ONLINE", "PAUSED")
+    return nodes
+
+
 @router.get("/node", response_model=ProviderNodeStatusResponse, summary="Get Provider Node Status")
 def get_node_status(
+    node_id: Optional[int] = None,
     provider_user: Dict[str, Any] = Depends(require_provider),
 ) -> ProviderNodeStatusResponse:
     """
     Retrieve live storage node status for the authenticated provider.
     Identity is strictly derived from validated JWT Bearer credentials.
+    Supports optional node_id query param when an account owns multiple nodes.
     """
     provider_id = provider_user["id"]
-    node = get_provider_node(provider_id)
+    all_nodes = get_provider_nodes_by_user_id(provider_id)
+    node = get_provider_node(provider_id, node_id=node_id)
 
     if not node:
         return ProviderNodeStatusResponse(
@@ -129,6 +148,8 @@ def get_node_status(
             warnings=["Storage directory not yet configured."],
             last_heartbeat=None,
             is_online=False,
+            total_nodes=len(all_nodes),
+            all_nodes=all_nodes,
         )
 
     effective_status = _compute_effective_status(node)
@@ -153,6 +174,8 @@ def get_node_status(
         warnings=warnings,
         last_heartbeat=str(node["last_heartbeat"]) if node.get("last_heartbeat") else None,
         is_online=(effective_status in ("ONLINE", "PAUSED")),
+        total_nodes=len(all_nodes),
+        all_nodes=all_nodes,
     )
 
 
@@ -167,7 +190,7 @@ def setup_node_storage(
     """
     provider_id = provider_user["id"]
     quota_bytes = int(payload.quota_gb * (1024**3))
-    existing = get_provider_node(provider_id)
+    existing = get_provider_node(provider_id, node_id=payload.node_id)
 
     if payload.action == "STOP":
         target_status = "STOPPED"
@@ -201,6 +224,7 @@ def setup_node_storage(
     effective_status = _compute_effective_status(node)
     available = max(0, node["quota_bytes"] - node["used_bytes"])
     warnings = _generate_node_warnings(node, effective_status)
+    all_nodes = get_provider_nodes_by_user_id(provider_id)
 
     return ProviderNodeStatusResponse(
         node_id=node.get("id"),
@@ -216,6 +240,8 @@ def setup_node_storage(
         warnings=warnings,
         last_heartbeat=str(node["last_heartbeat"]) if node.get("last_heartbeat") else None,
         is_online=(effective_status in ("ONLINE", "PAUSED")),
+        total_nodes=len(all_nodes),
+        all_nodes=all_nodes,
     )
 
 
@@ -238,6 +264,7 @@ def agent_heartbeat(
             status="STOPPED",
             action="STOP",
             quota_bytes=existing.get("quota_bytes"),
+            storage_dir=existing.get("storage_dir"),
             server_time=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -273,12 +300,14 @@ def agent_heartbeat(
         status=effective_status,
         action=action,
         quota_bytes=node.get("quota_bytes") if node else None,
+        storage_dir=node.get("storage_dir") if node else None,
         server_time=datetime.now(timezone.utc).isoformat(),
     )
 
 
 @router.get("/reconciliation", response_model=ReconciliationReportResponse, summary="Provider Physical Chunk Reconciliation")
 def get_reconciliation_report(
+    node_id: Optional[int] = None,
     provider_user: Dict[str, Any] = Depends(require_provider),
 ) -> ReconciliationReportResponse:
     """
@@ -287,7 +316,7 @@ def get_reconciliation_report(
     VERIFIED, MISSING, CORRUPTED, UNEXPECTED, UNVERIFIED.
     """
     provider_id = provider_user["id"]
-    node = get_provider_node(provider_id)
+    node = get_provider_node(provider_id, node_id=node_id)
     if not node:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Provider node not configured.")
 
@@ -331,13 +360,14 @@ def submit_inventory(
 @router.get("/jobs/history", response_model=ProviderJobTelemetryResponse, summary="Get Provider Job Telemetry and History")
 def get_jobs_history(
     limit: int = 20,
+    node_id: Optional[int] = None,
     provider_user: Dict[str, Any] = Depends(require_provider),
 ) -> ProviderJobTelemetryResponse:
     """
     Retrieve active, completed, and failed job counts and recent audit history.
     """
     provider_id = provider_user["id"]
-    node = get_provider_node(provider_id)
+    node = get_provider_node(provider_id, node_id=node_id)
     if not node:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Provider node not configured.")
 
@@ -378,6 +408,7 @@ def get_pending_jobs(
             status=j["status"],
             expires_at=str(j["expires_at"]),
             error_message=j.get("error_message"),
+            chunk_size=j.get("chunk_size"),
         )
         for j in jobs
     ]
